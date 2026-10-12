@@ -1,6 +1,6 @@
-#include <iostream>
+﻿#include <iostream>
 #include <iomanip>
-#include <Windows.h>
+#include <windows.h>
 #include <string>
 #include "SimpleHvClient.h"
 
@@ -82,7 +82,7 @@ int main() {
 
         std::string input;
         std::getline(std::cin, input);
-
+         
         if (input.empty()) {
             continue;
         }

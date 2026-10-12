@@ -150,9 +150,6 @@ DriverEntry(
         }
 	}
 
-    InstallTestHooks();
-
-
     SimpleHvLog("========================================");
     SimpleHvLog("[Driver] SimpleHv driver loaded successfully");
     SimpleHvLog("[Driver] Device ready: \\\\.\\SimpleHv");

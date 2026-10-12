@@ -1145,6 +1145,8 @@ EptHookPerformPageHookMonitorAndInlineHook(VIRTUAL_MACHINE_STATE * VCpu,
     //
     if (!PhysicalBaseAddress)
     {
+        SimpleHvLogError("[EptHook] Address translation failed: target=%p page=%p cr3=0x%llx mask=0x%x",
+                         TargetAddress, AlignedTargetVaOrPa, ProcessCr3.Flags, PageHookMask);
         VmmCallbackSetLastError(DEBUGGER_ERROR_INVALID_ADDRESS);
         return FALSE;
     }
@@ -1154,6 +1156,8 @@ EptHookPerformPageHookMonitorAndInlineHook(VIRTUAL_MACHINE_STATE * VCpu,
     //
     if (PhysicalBaseAddress >= SIZE_512_GB)
     {
+        SimpleHvLogError("[EptHook] Physical address exceeds EPT limit: target=%p physical=0x%llx",
+                         TargetAddress, PhysicalBaseAddress);
         VmmCallbackSetLastError(DEBUGGER_ERROR_CANNOT_PUT_EPT_HOOKS_ON_PHYSICAL_ADDRESS_ABOVE_512_GB);
         return FALSE;
     }
@@ -1174,6 +1178,8 @@ EptHookPerformPageHookMonitorAndInlineHook(VIRTUAL_MACHINE_STATE * VCpu,
             // Means that we find the address and !epthook2 doesn't support
             // multiple breakpoints in on page
             //
+            SimpleHvLogError("[EptHook] Page already hooked: target=%p physical=0x%llx existingVA=0x%llx",
+                             TargetAddress, PhysicalBaseAddress, HookedEntry->VirtualAddress);
             VmmCallbackSetLastError(DEBUGGER_ERROR_EPT_MULTIPLE_HOOKS_IN_A_SINGLE_PAGE);
             return FALSE;
         }
@@ -1186,6 +1192,8 @@ EptHookPerformPageHookMonitorAndInlineHook(VIRTUAL_MACHINE_STATE * VCpu,
 
     if (!HookedPage)
     {
+        SimpleHvLogError("[EptHook] Hook page pool exhausted: target=%p physical=0x%llx",
+                         TargetAddress, PhysicalBaseAddress);
         VmmCallbackSetLastError(DEBUGGER_ERROR_PRE_ALLOCATED_BUFFER_IS_EMPTY);
         return FALSE;
     }
@@ -1323,6 +1331,8 @@ EptHookPerformPageHookMonitorAndInlineHook(VIRTUAL_MACHINE_STATE * VCpu,
         PVOID * OutTrampoline = ((EPT_HOOKS_ADDRESS_DETAILS_FOR_EPTHOOK2 *)HookingDetails)->OutTrampoline;
         if (!EptHookInstructionMemory(HookedPage, ProcessCr3, TargetAddress, (PVOID)TargetAddressInSafeMemory, HookFunction, OutTrampoline))
         {
+            SimpleHvLogError("[EptHook] Failed to build inline detour: target=%p handler=%p offset=0x%Ix",
+                             TargetAddress, HookFunction, (SIZE_T)TargetAddress & (PAGE_SIZE - 1));
             PoolManagerFreePool((UINT64)HookedPage);
 
             VmmCallbackSetLastError(DEBUGGER_ERROR_COULD_NOT_BUILD_THE_EPT_HOOK);
@@ -1337,6 +1347,8 @@ EptHookPerformPageHookMonitorAndInlineHook(VIRTUAL_MACHINE_STATE * VCpu,
         //
         if (!EptSplitLargePage(g_GuestState[i].EptPageTable, TRUE, PhysicalBaseAddress))
         {
+            SimpleHvLogError("[EptHook] Failed to split large EPT page: core=%u physical=0x%llx",
+                             (UINT32)i, PhysicalBaseAddress);
             PoolManagerFreePool((UINT64)HookedPage);
 
             //
@@ -1357,6 +1369,8 @@ EptHookPerformPageHookMonitorAndInlineHook(VIRTUAL_MACHINE_STATE * VCpu,
         //
         if (!TargetPage)
         {
+            SimpleHvLogError("[EptHook] PML1 entry missing: core=%u physical=0x%llx",
+                             (UINT32)i, PhysicalBaseAddress);
             PoolManagerFreePool((UINT64)HookedPage);
 
             //
@@ -1475,6 +1489,8 @@ EptHookPerformMemoryOrInlineHook(VIRTUAL_MACHINE_STATE* VCpu,
 {
     UINT32 PageHookMask = 0;
     PVOID  HookDetailsToVmcall = NULL;
+    CR3_TYPE ProcessCr3 = { 0 };
+    NTSTATUS VmcallStatus;
 
     //
     // Check for the features to avoid EPT Violation problems
@@ -1573,10 +1589,15 @@ EptHookPerformMemoryOrInlineHook(VIRTUAL_MACHINE_STATE* VCpu,
     {
         if (VmxGetCurrentLaunchState())
         {
-            if (AsmVmxVmcall(VMCALL_CHANGE_PAGE_ATTRIB,
+            ProcessCr3 = LayoutGetCr3ByProcessId(ProcessId);
+            SimpleHvLog("[EptHook] VMCALL request: core=%u pid=%u cr3=0x%llx mask=0x%x target=%p",
+                        VCpu->CoreId, ProcessId, ProcessCr3.Flags, PageHookMask,
+                        EptHiddenHook2 ? EptHook2AddressDetails->TargetAddress : HookDetailsToVmcall);
+            VmcallStatus = AsmVmxVmcall(VMCALL_CHANGE_PAGE_ATTRIB,
                 (UINT64)HookDetailsToVmcall,
                 PageHookMask,
-                LayoutGetCr3ByProcessId(ProcessId).Flags) == STATUS_SUCCESS)
+                ProcessCr3.Flags);
+            if (VmcallStatus == STATUS_SUCCESS)
             {
                 //
                 // Test log
@@ -1602,14 +1623,19 @@ EptHookPerformMemoryOrInlineHook(VIRTUAL_MACHINE_STATE* VCpu,
             }
             else
             {
+                SimpleHvLogError("[EptHook] VMCALL_CHANGE_PAGE_ATTRIB failed: status=0x%08X pid=%u cr3=0x%llx mask=0x%x",
+                                 VmcallStatus, ProcessId, ProcessCr3.Flags, PageHookMask);
                 return FALSE;
             }
         }
         else
         {
+            ProcessCr3 = LayoutGetCr3ByProcessId(ProcessId);
+            SimpleHvLog("[EptHook] Direct hook request before VM launch: core=%u pid=%u cr3=0x%llx mask=0x%x",
+                        VCpu->CoreId, ProcessId, ProcessCr3.Flags, PageHookMask);
             if (EptHookPerformPageHookMonitorAndInlineHook(VCpu,
                 HookDetailsToVmcall,
-                LayoutGetCr3ByProcessId(ProcessId),
+                ProcessCr3,
                 PageHookMask) == TRUE)
             {
                 SimpleHvLogWarning("Hook applied (VM has not launched)");
@@ -1651,6 +1677,8 @@ EptHookInlineHook(VIRTUAL_MACHINE_STATE * VCpu,
     //
     if (VmxGetCurrentExecutionMode() == TRUE)
     {
+        SimpleHvLogError("[EptHookInlineHook] Called from VMX root: core=%u target=%p",
+                         VCpu->CoreId, TargetAddress);
         return FALSE;
     }
 
@@ -2542,6 +2570,7 @@ EptHookUnHookSingleAddressFromVmxRoot(UINT64                              Virtua
 VOID
 EptHookUnHookAll()
 {
+    PEPT_HOOKED_PAGE_DETAIL HookedEntry;
     //
     // Should be called from vmx non-root
     //
@@ -2561,23 +2590,25 @@ EptHookUnHookAll()
     // it from the buffers
     //
 
-    LIST_FOR_EACH_LINK(g_EptState->HookedPagesList, EPT_HOOKED_PAGE_DETAIL, PageHookList, CurrEntity)
+    while (!IsListEmpty(&g_EptState->HookedPagesList))
     {
+        HookedEntry = CONTAINING_RECORD(RemoveHeadList(&g_EptState->HookedPagesList),
+                                        EPT_HOOKED_PAGE_DETAIL, PageHookList);
         //
         // Now that we removed this hidden detours hook, it is
         // time to remove it from g_EptHook2sDetourListHead
         // if the hook is detours
         //
-        if (!CurrEntity->IsHiddenBreakpoint)
+        if (HookedEntry->IsExecutionHook)
         {
-            EptHookRemoveEntryAndFreePoolFromEptHook2sDetourList(CurrEntity->VirtualAddress);
+            EptHookRemoveEntryAndFreePoolFromEptHook2sDetourList(HookedEntry->VirtualAddress);
         }
 
         //
         // As we are in vmx-root here, we add the hooked entry to the list
         // of pools that will be deallocated on next IOCTL
         //
-        if (!PoolManagerFreePool((UINT64)CurrEntity))
+        if (!PoolManagerFreePool((UINT64)HookedEntry))
         {
             SimpleHvLogError("Err, something goes wrong, the pool not found in the list of previously allocated pools by pool manager");
         }

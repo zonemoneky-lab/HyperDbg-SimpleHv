@@ -1,4 +1,4 @@
-/**
+﻿/**
  * @file test.c
  * @brief EPT Hook 测试示例 - 使用 EptHookInstallHiddenInlineHookAuto
  * @details
@@ -39,6 +39,17 @@ typedef NTSTATUS(__stdcall* fnNtQuerySystemInformation)(
 
 fnObReferenceObjectByHandleWithTag old_ObpReferenceObjectByHandleWithTag = NULL;
 fnNtQuerySystemInformation old_NtQuerySystemInformation = NULL;
+static BOOLEAN g_ObpTestHookInstalled = FALSE;
+static BOOLEAN g_NtQueryTestHookInstalled = FALSE;
+
+VOID ResetTestHooksState(VOID)
+{
+	g_ObpTestHookInstalled = FALSE;
+	g_NtQueryTestHookInstalled = FALSE;
+	old_ObpReferenceObjectByHandleWithTag = NULL;
+	old_NtQuerySystemInformation = NULL;
+	SimpleHvLog("[Test] Test-hook state reset after UNHOOK_ALL");
+}
 
 // ========================================
 // 外部声明
@@ -278,7 +289,7 @@ NTSTATUS NtQuerySystemInformationHook(
  * @brief 安装所有测试 Hooks
  * @details 安装 ObpReferenceObjectByHandleWithTag 和 NtQuerySystemInformation 的 EPT Hooks
  * @return NTSTATUS 成功返回 STATUS_SUCCESS，失败返回相应错误码
- * @note 必须在 VMX non-root mode 下调用（在驱动入口点调用）
+ * @note 必须在 VMX non-root mode 下调用（从安装测试 Hook 的 IOCTL 调用）
  */
 NTSTATUS InstallTestHooks(VOID)
 {
@@ -286,6 +297,8 @@ NTSTATUS InstallTestHooks(VOID)
 	PVOID pNtQuerySystemInformation;
 
 	BOOLEAN result;
+	UINT32 coreId;
+	UINT32 processId;
 	UNICODE_STRING routineName;
 	SIZE_T i;
 
@@ -313,10 +326,20 @@ NTSTATUS InstallTestHooks(VOID)
 	//	0                                                   // ProcessId (0 = 内核 hook)
 	//);
 
-	result = ConfigureEptHook2(KeGetCurrentProcessorNumberEx(NULL),
+	coreId = KeGetCurrentProcessorNumberEx(NULL);
+	processId = HANDLE_TO_UINT32(PsGetCurrentProcessId());
+	SimpleHvLog("[Test] Hook 1 request: core=%u pid=%u IRQL=%u target=%p handler=%p pageOffset=0x%Ix",
+	            coreId, processId, KeGetCurrentIrql(), pObpReferenceObjectByHandleWithTag,
+	            ObpReferenceObjectByHandleWithTagHook,
+	            (SIZE_T)pObpReferenceObjectByHandleWithTag & (PAGE_SIZE - 1));
+	if (g_ObpTestHookInstalled) {
+		SimpleHvLog("[Test] Hook 1 already installed; trampoline=%p", old_ObpReferenceObjectByHandleWithTag);
+		goto install_hook_2;
+	}
+	result = ConfigureEptHook2(coreId,
 	                           pObpReferenceObjectByHandleWithTag,
 	                           (PVOID)ObpReferenceObjectByHandleWithTagHook,
-	                           (UINT32)(ULONG_PTR)PsGetCurrentProcessId(),
+	                           processId,
 	                           (PVOID *)&old_ObpReferenceObjectByHandleWithTag);
 	if (result) {
 		SimpleHvLog("[Test] Hook 1 installed: ObpReferenceObjectByHandleWithTag");
@@ -331,13 +354,17 @@ NTSTATUS InstallTestHooks(VOID)
 			SimpleHvLogError("[Test] ERROR: Trampoline address looks invalid: 0x%llx", old_ObpReferenceObjectByHandleWithTag);
 			return STATUS_UNSUCCESSFUL;
 		}
+		g_ObpTestHookInstalled = TRUE;
 	} else {
-		SimpleHvLogError("[Test] Failed to install Hook 1");
+		SimpleHvLogError("[Test] Failed to install Hook 1: core=%u pid=%u target=%p handler=%p trampoline=%p",
+		                 coreId, processId, pObpReferenceObjectByHandleWithTag,
+		                 ObpReferenceObjectByHandleWithTagHook, old_ObpReferenceObjectByHandleWithTag);
 		return STATUS_UNSUCCESSFUL;
 	}
 
 
 
+	install_hook_2:
 	// ========================================
 	// 3. Hook NtQuerySystemInformation
 	// ========================================
@@ -350,6 +377,12 @@ NTSTATUS InstallTestHooks(VOID)
 	}
 
 	SimpleHvLog("[Test] NtQuerySystemInformation: 0x%llx", pNtQuerySystemInformation);
+	coreId = KeGetCurrentProcessorNumberEx(NULL);
+	processId = HANDLE_TO_UINT32(PsGetCurrentProcessId());
+	SimpleHvLog("[Test] Hook 2 request: core=%u pid=%u IRQL=%u target=%p handler=%p pageOffset=0x%Ix",
+	            coreId, processId, KeGetCurrentIrql(), pNtQuerySystemInformation,
+	            NtQuerySystemInformationHook,
+	            (SIZE_T)pNtQuerySystemInformation & (PAGE_SIZE - 1));
 
 	// 安装 EPT Hook 并获取 trampoline 地址
 	//result = EptHookInstallHiddenInlineHookAuto(
@@ -357,11 +390,15 @@ NTSTATUS InstallTestHooks(VOID)
 	//	(PVOID)NtQuerySystemInformationHook,               // Hook 处理函数
 	//	0                                                   // ProcessId (0 = 内核 hook)
 	//);
-	result = ConfigureEptHook2(KeGetCurrentProcessorNumberEx(NULL),
+	if (g_NtQueryTestHookInstalled) {
+		SimpleHvLog("[Test] Hook 2 already installed; trampoline=%p", old_NtQuerySystemInformation);
+		goto hooks_installed;
+	}
+	result = ConfigureEptHook2(coreId,
 	                            pNtQuerySystemInformation,
 	                            (PVOID)NtQuerySystemInformationHook,
-	                            HANDLE_TO_UINT32(PsGetCurrentProcessId()),
-	                            (PVOID **)&old_NtQuerySystemInformation);
+	                            processId,
+	                            (PVOID *)&old_NtQuerySystemInformation);
 	if (result) {
 		SimpleHvLog("[Test] Hook 2 installed: NtQuerySystemInformation");
 		SimpleHvLog("[Test] Trampoline address: 0x%llx", old_NtQuerySystemInformation);
@@ -370,16 +407,20 @@ NTSTATUS InstallTestHooks(VOID)
 			SimpleHvLogError("[Test] ERROR: Hook 2 Trampoline is NULL!");
 			return STATUS_UNSUCCESSFUL;
 		}
-
+	
 		if ((UINT64)old_NtQuerySystemInformation < 0xFFFF000000000000) {
 			SimpleHvLogError("[Test] ERROR: Hook 2 Trampoline address looks invalid: 0x%llx", old_NtQuerySystemInformation);
 			return STATUS_UNSUCCESSFUL;
 		}
+		g_NtQueryTestHookInstalled = TRUE;
 	} else {
-		SimpleHvLogError("[Test] Failed to install Hook 2");
+		SimpleHvLogError("[Test] Failed to install Hook 2: core=%u pid=%u target=%p handler=%p trampoline=%p",
+		                 coreId, processId, pNtQuerySystemInformation,
+		                 NtQuerySystemInformationHook, old_NtQuerySystemInformation);
 		return STATUS_UNSUCCESSFUL;
 	}
 
+	hooks_installed:
 	// ========================================
 	// 4. 完成
 	// ========================================

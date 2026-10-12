@@ -124,6 +124,7 @@ HandleIoctlUnhookAll(PIRP Irp)
 
     // Call unhook function
     EptHookUnHookAll();
+	ResetTestHooksState();
 
     SimpleHvLog("[DeviceIoctl] All hooks removed");
 

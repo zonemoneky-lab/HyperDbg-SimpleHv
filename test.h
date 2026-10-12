@@ -19,7 +19,9 @@
  *         - STATUS_UNSUCCESSFUL: Hook 安装失败
  *
  * @note 调用此函数前，Hypervisor 必须已经启动
- * @note 此函数会自动预分配所需的内存池
- * @note 必须在 VMX non-root mode 下调用（从驱动入口点调用）
+ * @note 必须在 VMX non-root mode 下调用（从安装测试 Hook 的 IOCTL 调用）
  */
 NTSTATUS InstallTestHooks(VOID);
+
+/** Clear cached test-hook state after EptHookUnHookAll has removed the hooks. */
+VOID ResetTestHooksState(VOID);

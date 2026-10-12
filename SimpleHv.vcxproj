@@ -62,6 +62,15 @@
     <EnableInf2cat>false</EnableInf2cat>
     <TargetName>SimpleHv</TargetName>
   </PropertyGroup>
+  <PropertyGroup Label="Vcpkg" Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
+    <VcpkgUseStatic>true</VcpkgUseStatic>
+  </PropertyGroup>
+  <PropertyGroup Label="Vcpkg" Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
+    <VcpkgUseStatic>true</VcpkgUseStatic>
+  </PropertyGroup>
+  <PropertyGroup Label="Vcpkg">
+    <VcpkgEnabled>false</VcpkgEnabled>
+  </PropertyGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
     <DriverSign>
       <FileDigestAlgorithm>sha256</FileDigestAlgorithm>
@@ -78,7 +87,7 @@
     <Link>
       <TreatLinkerWarningAsErrors>false</TreatLinkerWarningAsErrors>
       <EntryPointSymbol>DriverEntry</EntryPointSymbol>
-      <AdditionalDependencies>$(SolutionDir)dependencies\zydis\msvc\bin\DebugX64Kernel\Zycore.lib;$(SolutionDir)dependencies\zydis\msvc\bin\DebugX64Kernel\Zydis.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>$(ProjectDir)dependencies\zydis\msvc\bin\DebugX64Kernel\Zycore.lib;$(ProjectDir)dependencies\zydis\msvc\bin\DebugX64Kernel\Zydis.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
@@ -98,9 +107,13 @@
     <Link>
       <TreatLinkerWarningAsErrors>false</TreatLinkerWarningAsErrors>
       <EntryPointSymbol>DriverEntry</EntryPointSymbol>
-      <AdditionalDependencies>$(SolutionDir)dependencies\zydis\msvc\bin\ReleaseX64Kernel\Zycore.lib;$(SolutionDir)dependencies\zydis\msvc\bin\ReleaseX64Kernel\Zydis.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>$(ProjectDir)dependencies\zydis\msvc\bin\ReleaseX64Kernel\Zycore.lib;$(ProjectDir)dependencies\zydis\msvc\bin\ReleaseX64Kernel\Zydis.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
   </ItemDefinitionGroup>
+  <Target Name="BuildZydisKernelLibraries" BeforeTargets="ResolveReferences">
+    <MSBuild Projects="$(ProjectDir)dependencies\zydis\msvc\dependencies\zycore\Zycore.vcxproj" Targets="Build" Properties="Configuration=$(Configuration) Kernel;Platform=$(Platform)" />
+    <MSBuild Projects="$(ProjectDir)dependencies\zydis\msvc\zydis\Zydis.vcxproj" Targets="Build" Properties="Configuration=$(Configuration) Kernel;Platform=$(Platform)" />
+  </Target>
   <ItemGroup>
     <ClInclude Include="header\assembly\InlineAsm.h" />
     <ClInclude Include="header\broadcast\Broadcast.h" />
