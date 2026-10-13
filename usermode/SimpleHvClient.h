@@ -25,6 +25,9 @@
 #define IOCTL_SIMPLEHV_UNHOOK_ALL \
     CTL_CODE(FILE_DEVICE_SIMPLEHV, 0x802, METHOD_BUFFERED, FILE_ANY_ACCESS)
 
+#define IOCTL_SIMPLEHV_SET_MIRWM_RANGE \
+    CTL_CODE(FILE_DEVICE_SIMPLEHV, 0x803, METHOD_BUFFERED, FILE_ANY_ACCESS)
+
 //////////////////////////////////////////////////
 //            Data Structures                   //
 //////////////////////////////////////////////////
@@ -39,6 +42,21 @@ typedef struct _SIMPLEHV_INSTALL_HOOKS_RESPONSE {
     UINT32 Status;          // NTSTATUS
     UINT32 HooksInstalled;
 } SIMPLEHV_INSTALL_HOOKS_RESPONSE, *PSIMPLEHV_INSTALL_HOOKS_RESPONSE;
+
+// 设置 MiRWM 保护范围（必须与驱动端 DeviceIoctl.h 布局一致）
+typedef struct _SIMPLEHV_SET_MIRWM_RANGE_REQUEST {
+    UINT32 ProcessId;       // 目标进程 PID
+    UINT32 Reserved;        // 对齐填充
+    UINT64 BaseAddress;     // 受保护模块基址
+    UINT64 Size;            // 受保护范围大小（0 = 关闭保护）
+} SIMPLEHV_SET_MIRWM_RANGE_REQUEST, *PSIMPLEHV_SET_MIRWM_RANGE_REQUEST;
+
+typedef struct _SIMPLEHV_SET_MIRWM_RANGE_RESPONSE {
+    UINT32 Status;          // NTSTATUS
+    UINT32 ProcessId;       // 实际生效的 PID
+    UINT64 BaseAddress;     // 实际生效的基址
+    UINT64 Size;            // 实际生效的大小
+} SIMPLEHV_SET_MIRWM_RANGE_RESPONSE, *PSIMPLEHV_SET_MIRWM_RANGE_RESPONSE;
 
 //////////////////////////////////////////////////
 //            SimpleHv Client Class             //
@@ -128,6 +146,34 @@ public:
             0,
             response,
             sizeof(SIMPLEHV_INSTALL_HOOKS_RESPONSE),
+            &bytesReturned,
+            NULL
+        ) != FALSE;
+    }
+
+    /**
+     * @brief Set MiRWM protect range (PID + module address range)
+     * @details 只保护 ProcessId 进程中 [BaseAddress, BaseAddress + Size) 的读取。
+     *          Size == 0 表示清除配置 / 关闭保护。
+     */
+    bool SetMiRwmRange(UINT32 processId, UINT64 baseAddress, UINT64 size,
+                       SIMPLEHV_SET_MIRWM_RANGE_RESPONSE* response) {
+        if (!IsConnected()) return false;
+
+        SIMPLEHV_SET_MIRWM_RANGE_REQUEST request = { 0 };
+        request.ProcessId   = processId;
+        request.Reserved    = 0;
+        request.BaseAddress = baseAddress;
+        request.Size        = size;
+
+        DWORD bytesReturned;
+        return DeviceIoControl(
+            hDevice,
+            IOCTL_SIMPLEHV_SET_MIRWM_RANGE,
+            &request,
+            sizeof(SIMPLEHV_SET_MIRWM_RANGE_REQUEST),
+            response,
+            sizeof(SIMPLEHV_SET_MIRWM_RANGE_RESPONSE),
             &bytesReturned,
             NULL
         ) != FALSE;

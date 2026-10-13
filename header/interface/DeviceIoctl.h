@@ -25,6 +25,10 @@
 #define IOCTL_SIMPLEHV_UNHOOK_ALL \
     CTL_CODE(FILE_DEVICE_SIMPLEHV, 0x802, METHOD_BUFFERED, FILE_ANY_ACCESS)
 
+// 设置 MiReadWriteVirtualMemory Hook 的保护范围（PID + 模块地址区间）
+#define IOCTL_SIMPLEHV_SET_MIRWM_RANGE \
+    CTL_CODE(FILE_DEVICE_SIMPLEHV, 0x803, METHOD_BUFFERED, FILE_ANY_ACCESS)
+
 //////////////////////////////////////////////////
 //            Data Structures                   //
 //////////////////////////////////////////////////
@@ -45,6 +49,30 @@ typedef struct _SIMPLEHV_INSTALL_HOOKS_RESPONSE {
     NTSTATUS Status;        // Installation status
     UINT32 HooksInstalled;  // Number of hooks installed
 } SIMPLEHV_INSTALL_HOOKS_RESPONSE, *PSIMPLEHV_INSTALL_HOOKS_RESPONSE;
+
+/**
+ * @brief 设置 MiRWM 保护范围的请求
+ * @details 只保护 ProcessId 进程中 [BaseAddress, BaseAddress + Size) 的读取。
+ *          Size == 0 表示清除配置 / 关闭保护。
+ *
+ *          字段统一使用 UINT64 / UINT32，保证与 usermode 端结构体布局一致。
+ */
+typedef struct _SIMPLEHV_SET_MIRWM_RANGE_REQUEST {
+    UINT32 ProcessId;       // 目标进程 PID
+    UINT32 Reserved;        // 对齐填充
+    UINT64 BaseAddress;     // 受保护模块基址
+    UINT64 Size;            // 受保护范围大小（0 = 关闭保护）
+} SIMPLEHV_SET_MIRWM_RANGE_REQUEST, *PSIMPLEHV_SET_MIRWM_RANGE_REQUEST;
+
+/**
+ * @brief 设置 MiRWM 保护范围的响应（回显实际生效的配置）
+ */
+typedef struct _SIMPLEHV_SET_MIRWM_RANGE_RESPONSE {
+    UINT32 Status;          // NTSTATUS
+    UINT32 ProcessId;       // 实际生效的 PID
+    UINT64 BaseAddress;     // 实际生效的基址
+    UINT64 Size;            // 实际生效的大小
+} SIMPLEHV_SET_MIRWM_RANGE_RESPONSE, *PSIMPLEHV_SET_MIRWM_RANGE_RESPONSE;
 
 //////////////////////////////////////////////////
 //            Function Declarations             //

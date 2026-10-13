@@ -100,7 +100,7 @@ HandleIoctlInstallTestHooks(PIRP Irp)
 
     response = (SIMPLEHV_INSTALL_HOOKS_RESPONSE*)Irp->AssociatedIrp.SystemBuffer;
     response->Status = status;
-    response->HooksInstalled = NT_SUCCESS(status) ? 2 : 0;
+    response->HooksInstalled = NT_SUCCESS(status) ? 3 : 0;
 
     if (NT_SUCCESS(status)) {
         SimpleHvLog("[DeviceIoctl] Test hooks installed successfully");
@@ -109,6 +109,61 @@ HandleIoctlInstallTestHooks(PIRP Irp)
     }
 
     Irp->IoStatus.Information = sizeof(SIMPLEHV_INSTALL_HOOKS_RESPONSE);
+    return STATUS_SUCCESS;
+}
+
+/**
+ * @brief Handle IOCTL_SIMPLEHV_SET_MIRWM_RANGE
+ * @details 设置 MiReadWriteVirtualMemory Hook 的保护范围（PID + 模块地址区间）。
+ *          只保护指定进程中落在 [BaseAddress, BaseAddress + Size) 的内存读取，
+ *          Size == 0 表示清除配置 / 关闭保护（Hook 变回纯透传）。
+ */
+NTSTATUS
+HandleIoctlSetMiRwmRange(PIRP Irp)
+{
+    PIO_STACK_LOCATION irpStack;
+    SIMPLEHV_SET_MIRWM_RANGE_REQUEST*  request;
+    SIMPLEHV_SET_MIRWM_RANGE_RESPONSE* response;
+    ULONG inputBufferLength;
+    ULONG outputBufferLength;
+    ULONG     processId;
+    ULONG_PTR baseAddress;
+    ULONG_PTR size;
+
+    irpStack           = IoGetCurrentIrpStackLocation(Irp);
+    inputBufferLength  = irpStack->Parameters.DeviceIoControl.InputBufferLength;
+    outputBufferLength = irpStack->Parameters.DeviceIoControl.OutputBufferLength;
+
+    if (inputBufferLength < sizeof(SIMPLEHV_SET_MIRWM_RANGE_REQUEST)) {
+        SimpleHvLogError("[DeviceIoctl] SET_MIRWM_RANGE: Input buffer too small (%u < %u)",
+                         inputBufferLength, (ULONG)sizeof(SIMPLEHV_SET_MIRWM_RANGE_REQUEST));
+        return STATUS_BUFFER_TOO_SMALL;
+    }
+    if (outputBufferLength < sizeof(SIMPLEHV_SET_MIRWM_RANGE_RESPONSE)) {
+        SimpleHvLogError("[DeviceIoctl] SET_MIRWM_RANGE: Output buffer too small (%u < %u)",
+                         outputBufferLength, (ULONG)sizeof(SIMPLEHV_SET_MIRWM_RANGE_RESPONSE));
+        return STATUS_BUFFER_TOO_SMALL;
+    }
+
+    // METHOD_BUFFERED: 输入 / 输出共用 SystemBuffer，先读出来再写回
+    request     = (SIMPLEHV_SET_MIRWM_RANGE_REQUEST*)Irp->AssociatedIrp.SystemBuffer;
+    processId   = (ULONG)request->ProcessId;
+    baseAddress = (ULONG_PTR)request->BaseAddress;
+    size        = (ULONG_PTR)request->Size;
+
+    SimpleHvLog("[DeviceIoctl] SET_MIRWM_RANGE: pid=%u base=0x%llx size=0x%llx",
+                processId, (UINT64)baseAddress, (UINT64)size);
+
+    // 应用到 Hook（内部会打自己的日志）
+    SetMiRWMProtectRange(processId, baseAddress, size);
+
+    response = (SIMPLEHV_SET_MIRWM_RANGE_RESPONSE*)Irp->AssociatedIrp.SystemBuffer;
+    response->Status      = (UINT32)STATUS_SUCCESS;
+    response->ProcessId   = processId;
+    response->BaseAddress = (UINT64)baseAddress;
+    response->Size        = (UINT64)size;
+
+    Irp->IoStatus.Information = sizeof(SIMPLEHV_SET_MIRWM_RANGE_RESPONSE);
     return STATUS_SUCCESS;
 }
 
@@ -161,6 +216,10 @@ DeviceIoctlDispatch(PDEVICE_OBJECT DeviceObject, PIRP Irp)
 
         case IOCTL_SIMPLEHV_UNHOOK_ALL:
             status = HandleIoctlUnhookAll(Irp);
+            break;
+
+        case IOCTL_SIMPLEHV_SET_MIRWM_RANGE:
+            status = HandleIoctlSetMiRwmRange(Irp);
             break;
 
         default:

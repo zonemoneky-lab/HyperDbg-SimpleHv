@@ -11,6 +11,7 @@ void PrintMenu() {
     std::cout << "  1. Ping Hypervisor" << std::endl;
     std::cout << "  2. Install Test Hooks" << std::endl;
     std::cout << "  3. Unhook All" << std::endl;
+    std::cout << "  4. Set MiRWM Protect Range (PID + Module)" << std::endl;
     std::cout << "  0. Exit" << std::endl;
     std::cout << "========================================" << std::endl;
     std::cout << "Select option: ";
@@ -44,6 +45,95 @@ void RunPingTest(SimpleHv::Client& client) {
     } else {
         std::cout << "[-] Unexpected signature!" << std::endl;
     }
+    std::cout << std::endl;
+}
+
+// 读取一行输入并解析为 64 位无符号数（base=0 自动识别 0x 十六进制 / 十进制）
+static bool ReadUInt64(const char* prompt, UINT64& out) {
+    std::cout << prompt;
+    std::string line;
+    if (!std::getline(std::cin, line)) {
+        return false;
+    }
+    if (line.empty()) {
+        return false;
+    }
+    try {
+        size_t pos = 0;
+        out = std::stoull(line, &pos, 0);
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
+void RunSetMiRwmRangeTest(SimpleHv::Client& client) {
+    std::cout << std::endl;
+    std::cout << "========================================" << std::endl;
+    std::cout << "   Set MiRWM Protect Range              " << std::endl;
+    std::cout << "========================================" << std::endl;
+    std::cout << "  Only reads inside [Base, Base+Size)  " << std::endl;
+    std::cout << "  of the target PID are protected." << std::endl;
+    std::cout << "  (the intersected part is zeroed)" << std::endl;
+    std::cout << "  Size = 0 disables protection." << std::endl;
+    std::cout << "========================================" << std::endl;
+    std::cout << std::endl;
+
+    UINT64 pid  = 0;
+    UINT64 base = 0;
+    UINT64 size = 0;
+
+    if (!ReadUInt64("[*] Target PID (decimal, e.g. 1234): ", pid)) {
+        std::cout << "[-] Invalid PID input" << std::endl;
+        std::cout << std::endl;
+        return;
+    }
+
+    if (pid == 0) {
+        std::cout << "[*] PID = 0 -> clearing config / disabling protection (Size forced to 0)" << std::endl;
+    } else {
+        if (!ReadUInt64("[*] Module BaseAddress (hex, e.g. 0x7FF6A0000000): ", base)) {
+            std::cout << "[-] Invalid base address input" << std::endl;
+            std::cout << std::endl;
+            return;
+        }
+        if (!ReadUInt64("[*] Protect Size (hex, e.g. 0x1000, 0 = disable): ", size)) {
+            std::cout << "[-] Invalid size input" << std::endl;
+            std::cout << std::endl;
+            return;
+        }
+    }
+
+    std::cout << std::endl;
+    std::cout << "[*] Sending IOCTL_SIMPLEHV_SET_MIRWM_RANGE..." << std::endl;
+    std::cout << "    PID  : " << pid << std::endl;
+    std::cout << "    Base : 0x" << std::hex << std::uppercase << base << std::dec << std::endl;
+    std::cout << "    Size : 0x" << std::hex << std::uppercase << size << std::dec << std::endl;
+
+    SIMPLEHV_SET_MIRWM_RANGE_RESPONSE response = { 0 };
+    if (client.SetMiRwmRange((UINT32)pid, base, size, &response)) {
+        std::cout << "[*] IOCTL completed" << std::endl;
+        std::cout << "    Status      : 0x" << std::hex << std::uppercase
+                  << response.Status << std::dec << std::endl;
+        std::cout << "    Applied PID : " << response.ProcessId << std::endl;
+        std::cout << "    Applied Base: 0x" << std::hex << std::uppercase
+                  << response.BaseAddress << std::dec << std::endl;
+        std::cout << "    Applied Size: 0x" << std::hex << std::uppercase
+                  << response.Size << std::dec << std::endl;
+
+        if (response.Status == 0) {
+            if (response.Size == 0) {
+                std::cout << "[+] Protection CLEARED (Hook is passthrough now)" << std::endl;
+            } else {
+                std::cout << "[+] Protect range applied!" << std::endl;
+            }
+        } else {
+            std::cout << "[-] Failed to set protect range" << std::endl;
+        }
+    } else {
+        std::cout << "[-] IOCTL failed! Error: " << GetLastError() << std::endl;
+    }
+
     std::cout << std::endl;
 }
 
@@ -142,6 +232,12 @@ int main() {
                 }
 
                 std::cout << std::endl;
+                std::cout << "Press any key to continue..." << std::endl;
+                system("pause");
+                break;
+
+            case 4:
+                RunSetMiRwmRangeTest(client);
                 std::cout << "Press any key to continue..." << std::endl;
                 system("pause");
                 break;
