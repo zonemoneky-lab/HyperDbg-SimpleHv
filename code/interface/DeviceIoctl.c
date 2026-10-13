@@ -100,7 +100,7 @@ HandleIoctlInstallTestHooks(PIRP Irp)
 
     response = (SIMPLEHV_INSTALL_HOOKS_RESPONSE*)Irp->AssociatedIrp.SystemBuffer;
     response->Status = status;
-    response->HooksInstalled = NT_SUCCESS(status) ? 3 : 0;
+    response->HooksInstalled = NT_SUCCESS(status) ? 4 : 0;
 
     if (NT_SUCCESS(status)) {
         SimpleHvLog("[DeviceIoctl] Test hooks installed successfully");
@@ -168,6 +168,61 @@ HandleIoctlSetMiRwmRange(PIRP Irp)
 }
 
 /**
+ * @brief Handle IOCTL_SIMPLEHV_SET_MMCOPY_REGION
+ * @details 设置 MmCopyMemory Hook 的隐藏区域（可选 PID + 地址区间）。
+ *          源地址范围与 [Start, Start + Size) 重叠的拷贝会被拦截。
+ *          Size == 0 表示清除配置 / 关闭拦截。
+ */
+NTSTATUS
+HandleIoctlSetMmCopyRegion(PIRP Irp)
+{
+    PIO_STACK_LOCATION irpStack;
+    SIMPLEHV_SET_MMCOPY_REGION_REQUEST*  request;
+    SIMPLEHV_SET_MMCOPY_REGION_RESPONSE* response;
+    ULONG inputBufferLength;
+    ULONG outputBufferLength;
+    ULONG     processId;
+    ULONG_PTR start;
+    ULONG_PTR size;
+
+    irpStack           = IoGetCurrentIrpStackLocation(Irp);
+    inputBufferLength  = irpStack->Parameters.DeviceIoControl.InputBufferLength;
+    outputBufferLength = irpStack->Parameters.DeviceIoControl.OutputBufferLength;
+
+    if (inputBufferLength < sizeof(SIMPLEHV_SET_MMCOPY_REGION_REQUEST)) {
+        SimpleHvLogError("[DeviceIoctl] SET_MMCOPY_REGION: Input buffer too small (%u < %u)",
+                         inputBufferLength, (ULONG)sizeof(SIMPLEHV_SET_MMCOPY_REGION_REQUEST));
+        return STATUS_BUFFER_TOO_SMALL;
+    }
+    if (outputBufferLength < sizeof(SIMPLEHV_SET_MMCOPY_REGION_RESPONSE)) {
+        SimpleHvLogError("[DeviceIoctl] SET_MMCOPY_REGION: Output buffer too small (%u < %u)",
+                         outputBufferLength, (ULONG)sizeof(SIMPLEHV_SET_MMCOPY_REGION_RESPONSE));
+        return STATUS_BUFFER_TOO_SMALL;
+    }
+
+    // METHOD_BUFFERED: 输入 / 输出共用 SystemBuffer，先读出来再写回
+    request   = (SIMPLEHV_SET_MMCOPY_REGION_REQUEST*)Irp->AssociatedIrp.SystemBuffer;
+    processId = (ULONG)request->ProcessId;
+    start     = (ULONG_PTR)request->Start;
+    size      = (ULONG_PTR)request->Size;
+
+    SimpleHvLog("[DeviceIoctl] SET_MMCOPY_REGION: pid=%u start=0x%llx size=0x%llx",
+                processId, (UINT64)start, (UINT64)size);
+
+    // 应用到 Hook（内部会打自己的日志）
+    SetMmCopyHideRegion(processId, start, size);
+
+    response = (SIMPLEHV_SET_MMCOPY_REGION_RESPONSE*)Irp->AssociatedIrp.SystemBuffer;
+    response->Status    = (UINT32)STATUS_SUCCESS;
+    response->ProcessId = processId;
+    response->Start     = (UINT64)start;
+    response->Size      = (UINT64)size;
+
+    Irp->IoStatus.Information = sizeof(SIMPLEHV_SET_MMCOPY_REGION_RESPONSE);
+    return STATUS_SUCCESS;
+}
+
+/**
  * @brief Handle IOCTL_SIMPLEHV_UNHOOK_ALL
  */
 NTSTATUS
@@ -220,6 +275,10 @@ DeviceIoctlDispatch(PDEVICE_OBJECT DeviceObject, PIRP Irp)
 
         case IOCTL_SIMPLEHV_SET_MIRWM_RANGE:
             status = HandleIoctlSetMiRwmRange(Irp);
+            break;
+
+        case IOCTL_SIMPLEHV_SET_MMCOPY_REGION:
+            status = HandleIoctlSetMmCopyRegion(Irp);
             break;
 
         default:

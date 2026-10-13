@@ -13,7 +13,8 @@
  * @details 安装以下 Hooks：
  *          1. ObpReferenceObjectByHandleWithTag - 保护指定进程不被打开
  *          2. NtQuerySystemInformation - 隐藏指定进程
- *          3. MiReadWriteVirtualMemory - 拦截跨进程内存读写（特征码扫描定位）
+ *          3. MiCopyVirtualMemory - 拦截跨进程内存读写（从 MmCopyVirtualMemory 反汇编定位）
+ *          4. MmCopyMemory - 拦截直接内存拷贝（导出函数，隐藏区域命中即阻断）
  *
  * @return NTSTATUS
  *         - STATUS_SUCCESS: 所有 Hook 安装成功
@@ -28,7 +29,7 @@ NTSTATUS InstallTestHooks(VOID);
 VOID ResetTestHooksState(VOID);
 
 /**
- * @brief 设置 MiReadWriteVirtualMemory Hook 的保护范围
+ * @brief 设置 MiCopyVirtualMemory Hook 的保护范围
  * @details 只保护「PID == ProcessId 的进程」中、地址落在
  *          [BaseAddress, BaseAddress + Size) 的内存读取：命中的那一段会被
  *          清零，范围之外完全不动。
@@ -42,3 +43,21 @@ VOID ResetTestHooksState(VOID);
  * @note 该配置随时可改，无需重新安装 Hook；Hook 内部会实时读取这些值。
  */
 VOID SetMiRWMProtectRange(ULONG ProcessId, ULONG_PTR BaseAddress, ULONG_PTR Size);
+
+/**
+ * @brief 设置 MmCopyMemory Hook 的隐藏区域
+ * @details 当某次 MmCopyMemory 的「源地址范围」与
+ *          [Start, Start + Size) 发生重叠时，直接拦截
+ *          （返回 0xC0000018，传输字节数置 0）。
+ *
+ *          - VIRTUAL 源：直接比较 VirtualAddress 区间；
+ *          - PHYSICAL 源：先 MmGetVirtualForPhysical 映射再比较。
+ *          - ProcessId != 0 时只拦截「当前进程上下文 == 该 PID」的请求；
+ *            ProcessId == 0 表示不限进程。
+ *          - Size == 0 表示清除配置 / 关闭拦截（Hook 变回纯透传）。
+ *
+ * @param ProcessId 可选，限定进程；0 = 任意进程
+ * @param Start     隐藏区域起始地址
+ * @param Size      隐藏区域大小（字节），0 = 关闭
+ */
+VOID SetMmCopyHideRegion(ULONG ProcessId, ULONG_PTR Start, ULONG_PTR Size);

@@ -12,6 +12,7 @@ void PrintMenu() {
     std::cout << "  2. Install Test Hooks" << std::endl;
     std::cout << "  3. Unhook All" << std::endl;
     std::cout << "  4. Set MiRWM Protect Range (PID + Module)" << std::endl;
+    std::cout << "  5. Set MmCopyMemory Hide Region" << std::endl;
     std::cout << "  0. Exit" << std::endl;
     std::cout << "========================================" << std::endl;
     std::cout << "Select option: ";
@@ -137,6 +138,77 @@ void RunSetMiRwmRangeTest(SimpleHv::Client& client) {
     std::cout << std::endl;
 }
 
+void RunSetMmCopyRegionTest(SimpleHv::Client& client) {
+    std::cout << std::endl;
+    std::cout << "========================================" << std::endl;
+    std::cout << "   Set MmCopyMemory Hide Region         " << std::endl;
+    std::cout << "========================================" << std::endl;
+    std::cout << "  Any MmCopyMemory whose SOURCE range   " << std::endl;
+    std::cout << "  overlaps [Start, Start+Size) is       " << std::endl;
+    std::cout << "  blocked (returns 0xC0000018).         " << std::endl;
+    std::cout << "  PID = 0  -> apply to ANY process.     " << std::endl;
+    std::cout << "  Size = 0 -> disable interception.     " << std::endl;
+    std::cout << "========================================" << std::endl;
+    std::cout << std::endl;
+
+    UINT64 pid   = 0;
+    UINT64 start = 0;
+    UINT64 size  = 0;
+
+    if (!ReadUInt64("[*] Target PID (decimal, 0 = any process): ", pid)) {
+        std::cout << "[-] Invalid PID input" << std::endl;
+        std::cout << std::endl;
+        return;
+    }
+
+    if (pid == 0) {
+        std::cout << "[*] PID = 0 -> only clearing config / disabling interception" << std::endl;
+    } else {
+        if (!ReadUInt64("[*] Hide Region Start (hex, e.g. 0xFFFF800000000000): ", start)) {
+            std::cout << "[-] Invalid start address input" << std::endl;
+            std::cout << std::endl;
+            return;
+        }
+        if (!ReadUInt64("[*] Hide Region Size (hex, e.g. 0x1000, 0 = disable): ", size)) {
+            std::cout << "[-] Invalid size input" << std::endl;
+            std::cout << std::endl;
+            return;
+        }
+    }
+
+    std::cout << std::endl;
+    std::cout << "[*] Sending IOCTL_SIMPLEHV_SET_MMCOPY_REGION..." << std::endl;
+    std::cout << "    PID   : " << pid << std::endl;
+    std::cout << "    Start : 0x" << std::hex << std::uppercase << start << std::dec << std::endl;
+    std::cout << "    Size  : 0x" << std::hex << std::uppercase << size << std::dec << std::endl;
+
+    SIMPLEHV_SET_MMCOPY_REGION_RESPONSE response = { 0 };
+    if (client.SetMmCopyRegion((UINT32)pid, start, size, &response)) {
+        std::cout << "[*] IOCTL completed" << std::endl;
+        std::cout << "    Status      : 0x" << std::hex << std::uppercase
+                  << response.Status << std::dec << std::endl;
+        std::cout << "    Applied PID : " << response.ProcessId << std::endl;
+        std::cout << "    Applied Start: 0x" << std::hex << std::uppercase
+                  << response.Start << std::dec << std::endl;
+        std::cout << "    Applied Size : 0x" << std::hex << std::uppercase
+                  << response.Size << std::dec << std::endl;
+
+        if (response.Status == 0) {
+            if (response.Size == 0) {
+                std::cout << "[+] Hide region CLEARED (Hook is passthrough now)" << std::endl;
+            } else {
+                std::cout << "[+] Hide region applied!" << std::endl;
+            }
+        } else {
+            std::cout << "[-] Failed to set hide region" << std::endl;
+        }
+    } else {
+        std::cout << "[-] IOCTL failed! Error: " << GetLastError() << std::endl;
+    }
+
+    std::cout << std::endl;
+}
+
 int main() {
     std::cout << "========================================" << std::endl;
     std::cout << "   SimpleHv Usermode Test Client       " << std::endl;
@@ -238,6 +310,12 @@ int main() {
 
             case 4:
                 RunSetMiRwmRangeTest(client);
+                std::cout << "Press any key to continue..." << std::endl;
+                system("pause");
+                break;
+
+            case 5:
+                RunSetMmCopyRegionTest(client);
                 std::cout << "Press any key to continue..." << std::endl;
                 system("pause");
                 break;

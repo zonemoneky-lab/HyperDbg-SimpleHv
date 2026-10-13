@@ -29,6 +29,10 @@
 #define IOCTL_SIMPLEHV_SET_MIRWM_RANGE \
     CTL_CODE(FILE_DEVICE_SIMPLEHV, 0x803, METHOD_BUFFERED, FILE_ANY_ACCESS)
 
+// 设置 MmCopyMemory Hook 的隐藏区域（可选 PID + 地址区间）
+#define IOCTL_SIMPLEHV_SET_MMCOPY_REGION \
+    CTL_CODE(FILE_DEVICE_SIMPLEHV, 0x804, METHOD_BUFFERED, FILE_ANY_ACCESS)
+
 //////////////////////////////////////////////////
 //            Data Structures                   //
 //////////////////////////////////////////////////
@@ -73,6 +77,29 @@ typedef struct _SIMPLEHV_SET_MIRWM_RANGE_RESPONSE {
     UINT64 BaseAddress;     // 实际生效的基址
     UINT64 Size;            // 实际生效的大小
 } SIMPLEHV_SET_MIRWM_RANGE_RESPONSE, *PSIMPLEHV_SET_MIRWM_RANGE_RESPONSE;
+
+/**
+ * @brief 设置 MmCopyMemory 隐藏区域的请求
+ * @details 源地址范围与 [Start, Start + Size) 重叠的拷贝会被拦截。
+ *          ProcessId == 0 表示不限进程（任意地址空间上下文都拦）。
+ *          Size == 0 表示清除配置 / 关闭拦截。
+ */
+typedef struct _SIMPLEHV_SET_MMCOPY_REGION_REQUEST {
+    UINT32 ProcessId;       // 可选，限定进程；0 = 任意进程
+    UINT32 Reserved;        // 对齐填充
+    UINT64 Start;           // 隐藏区域起始地址
+    UINT64 Size;            // 隐藏区域大小（0 = 关闭拦截）
+} SIMPLEHV_SET_MMCOPY_REGION_REQUEST, *PSIMPLEHV_SET_MMCOPY_REGION_REQUEST;
+
+/**
+ * @brief 设置 MmCopyMemory 隐藏区域的响应（回显实际生效的配置）
+ */
+typedef struct _SIMPLEHV_SET_MMCOPY_REGION_RESPONSE {
+    UINT32 Status;          // NTSTATUS
+    UINT32 ProcessId;       // 实际生效的 PID
+    UINT64 Start;           // 实际生效的起始地址
+    UINT64 Size;            // 实际生效的大小
+} SIMPLEHV_SET_MMCOPY_REGION_RESPONSE, *PSIMPLEHV_SET_MMCOPY_REGION_RESPONSE;
 
 //////////////////////////////////////////////////
 //            Function Declarations             //

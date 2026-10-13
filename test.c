@@ -3,10 +3,11 @@
  * @brief EPT Hook 测试示例 - 使用 EptHookInstallHiddenInlineHookAuto
  * @details
  *     演示如何使用 EptHookInstallHiddenInlineHookAuto 实现内核函数 Hook
- *     Hook 三个关键函数实现进程保护：
+ *     Hook 四个关键函数实现进程保护：
  *     1. ObpReferenceObjectByHandleWithTag - 防止进程被打开
  *     2. NtQuerySystemInformation - 隐藏进程
- *     3. MiReadWriteVirtualMemory - 拦截跨进程内存读写（通过特征码扫描定位）
+ *     3. MiCopyVirtualMemory - 拦截跨进程内存读写（从 MmCopyVirtualMemory 反汇编定位）
+ *     4. MmCopyMemory - 拦截直接内存拷贝（导出函数，隐藏区域命中即阻断）
  */
 
 #include "pch.h"
@@ -35,36 +36,66 @@ typedef NTSTATUS(__stdcall* fnNtQuerySystemInformation)(
 );
 
 /*
- * MiReadWriteVirtualMemory function type.
+ * MiCopyVirtualMemory function type.
  *
- * This is the internal (non-exported) kernel function that both
- * NtReadVirtualMemory and NtWriteVirtualMemory call to perform the
- * actual cross-process memory copy.
+ * 这是「跨进程内存拷贝」的底层公共函数（未导出）：
  *
- * IDA signature at 14093B450:
- *   48 89 5C 24 ? 48 89 74 24 ? 4C 89 44 24 ? 48 89 54 24 ?
- *   57 41 54 41 55 41 56 41 57 48 83 EC
+ *     NtReadVirtualMemory / NtWriteVirtualMemory
+ *         -> MiReadWriteVirtualMemory
+ *              -> MiCopyVirtualMemory        <-- 本 Hook 的目标
+ *     MmCopyVirtualMemory (导出)
+ *         -> MiCopyVirtualMemory
  *
- * MiReadWriteVirtualMemory 的原型在不同 Windows 版本上不完全一致：
- *   旧版 (Win10 早期)：6 参数，第 6 个是 ACCESS_MASK DesiredAccess，
- *                      PreviousMode 从当前线程读取（ExGetPreviousMode）。
- *   新版 (Win11/近版)：多一个栈上传参（第 7 个）。
+ * 因此只需 Hook MiCopyVirtualMemory 一处，即可覆盖上面所有调用路径，
+ * 比分别 Hook NtReadVirtualMemory / NtWriteVirtualMemory 更省、更稳。
  *
- * 因此这里统一声明为 7 参数「超集」，全部按位置原样透传：
- *   - 若真实函数只有 6 个参数，多传的第 7 个会被忽略，无副作用；
- *   - 若真实函数有 7 个参数，则第 7 个被正确转发（避免它读到栈垃圾，
- *     之前的 6 参数声明就是因为没透传第 7 个而返回 STATUS_INVALID_PARAMETER）。
- * 参数名用 Arg6/Arg7，避免语义误解 —— 需要 PreviousMode 时一律用
- * ExGetPreviousMode()，不要依赖 Arg6。
+ * 原型与 MmCopyVirtualMemory 一致（后者只是它的包装）：
+ *   NTSTATUS MiCopyVirtualMemory(
+ *       PEPROCESS        SourceProcess,   // 从哪个进程读
+ *       PVOID            SourceAddress,   // 源地址（SourceProcess 内）
+ *       PEPROCESS        TargetProcess,   // 写到哪个进程
+ *       PVOID            TargetAddress,   // 目标地址（调用方的输出缓冲区）
+ *       SIZE_T           BufferSize,      // 字节数
+ *       KPROCESSOR_MODE  PreviousMode,
+ *       PSIZE_T          ReturnSize);     // 实际拷贝字节数
+ *
+ * 地址定位见 ResolveMiCopyVirtualMemory()：从导出函数 MmCopyVirtualMemory
+ * 反汇编出其中的相对 call/jmp 即为 MiCopyVirtualMemory（不再使用 IDA 特征码扫描）。
  */
-typedef NTSTATUS(NTAPI* pMiReadWriteVirtualMemory)(
-	HANDLE ProcessHandle,
-	PVOID BaseAddress,
-	PVOID Buffer,
+typedef NTSTATUS(NTAPI* pMiCopyVirtualMemory)(
+	PEPROCESS SourceProcess,
+	PVOID SourceAddress,
+	PEPROCESS TargetProcess,
+	PVOID TargetAddress,
 	SIZE_T BufferSize,
-	PSIZE_T NumberOfBytesRead,
-	ULONG_PTR Arg6,
-	ULONG_PTR Arg7
+	KPROCESSOR_MODE PreviousMode,
+	PSIZE_T ReturnSize
+);
+
+/*
+ * MmCopyMemory function type.
+ *
+ * 这是 **导出** 的内核函数（ntoskrnl 导出，可用 MmGetSystemRoutineAddress 定位），
+ * 用于在「任意虚拟地址 / 物理地址」与目标缓冲区之间拷贝内存。很多驱动/工具
+ * 会用它来读取物理内存或内核内存，因此 hook 它可以拦截「绕过
+ * NtReadVirtualMemory 直接读内存」的访问方式。
+ *
+ * 原型（WDK）：
+ *   NTSTATUS MmCopyMemory(
+ *       _Out_writes_bytes_(NumberOfBytes) PVOID  TargetAddress,
+ *       _In_                             MM_COPY_ADDRESS SourceAddress,
+ *       _In_                             SIZE_T   NumberOfBytes,
+ *       _In_                             ULONG    Flags,
+ *       _Out_                            PSIZE_T  NumberOfBytesTransferred);
+ *
+ * Flags: MM_COPY_MEMORY_VIRTUAL (0x2) / MM_COPY_MEMORY_PHYSICAL (0x1)
+ */
+typedef NTSTATUS(NTAPI* pMmCopyMemory)(
+	PVOID TargetAddress,
+	MM_COPY_ADDRESS SourceAddress,
+	SIZE_T NumberOfBytes,
+	ULONG Flags,
+	PSIZE_T NumberOfBytesTransferred
 );
 
 // ========================================
@@ -73,50 +104,141 @@ typedef NTSTATUS(NTAPI* pMiReadWriteVirtualMemory)(
 
 fnObReferenceObjectByHandleWithTag old_ObpReferenceObjectByHandleWithTag = NULL;
 fnNtQuerySystemInformation old_NtQuerySystemInformation = NULL;
-pMiReadWriteVirtualMemory old_MiReadWriteVirtualMemory = NULL;
+pMiCopyVirtualMemory old_MiCopyVirtualMemory = NULL;
+pMmCopyMemory old_MmCopyMemory = NULL;
 static BOOLEAN g_ObpTestHookInstalled = FALSE;
 static BOOLEAN g_NtQueryTestHookInstalled = FALSE;
 static BOOLEAN g_MiRWM_TestHookInstalled = FALSE;
+static BOOLEAN g_MmCopyTestHookInstalled = FALSE;
 
 /*
- * MiRWM 运行期日志限流：
- * MiReadWriteVirtualMemory 每次跨进程读写都会进入 Hook，若目标进程被频繁
- * 读取会疯狂刷屏。这里只打印前 MIRWM_HOOK_LOG_LIMIT 次命中，之后静默
- * （缓冲区依然会被正常清零，只是不再打日志）。
+ * MiCopy 运行期日志限流：
+ * MiCopyVirtualMemory 每次跨进程读写都会进入 Hook，若目标进程被频繁
+ * 读取/写入会疯狂刷屏。这里只打印前 MIRWM_HOOK_LOG_LIMIT 次命中，之后静默
+ * （读取依然会被正常清零 / 写入依然会被拦截，只是不再打日志）。
  */
 #define MIRWM_HOOK_LOG_LIMIT 8
-static volatile LONG g_MiRWM_HookHitCount = 0;
+static volatile LONG g_MiRWM_HookHitCount = 0;      /* 读取命中（清零）次数 */
+static volatile LONG g_MiRWM_WriteBlockCount = 0;   /* 写入命中（拦截）次数 */
 
 /*
  * ============================================================
- * MiRWM 保护范围配置（由 usermode 通过 IOCTL 设置）
+ * MiCopy 保护范围配置（由 usermode 通过 IOCTL 设置）
  * ============================================================
+ * Hook 目标已从 MiReadWriteVirtualMemory 改为其底层公共函数
+ * MiCopyVirtualMemory（见 ResolveMiCopyVirtualMemory）。配置语义不变：
  * 只保护「PID == g_MiRWM_TargetPid 的进程」中、地址落在
  *   [g_MiRWM_ProtectBase, g_MiRWM_ProtectBase + g_MiRWM_ProtectSize)
  * 范围内的内存读取：命中的那一段会被清零，范围之外完全不动。
  *
  * g_MiRWM_ProtectSize == 0 表示未配置 / 关闭保护 —— 此时 Hook 纯透传，
  * 对系统行为零影响（避免误伤）。
+ *
+ * （变量名保留 MiRWM 前缀，是为了与既有的 IOCTL / usermode 接口命名保持一致。）
  */
 static volatile ULONG_PTR g_MiRWM_TargetPid   = 0;
 static volatile ULONG_PTR g_MiRWM_ProtectBase = 0;
 static volatile ULONG_PTR g_MiRWM_ProtectSize = 0;
+
+/*
+ * ============================================================
+ * MmCopyMemory 隐藏区域配置（由 usermode 通过 IOCTL 设置）
+ * ============================================================
+ * 当某次 MmCopyMemory 的「源地址范围」与
+ *   [g_HideMemRegionStart, g_HideMemRegionStart + g_HideMemRegionSize)
+ * 发生重叠时，直接拦截（返回 STATUS_INVALID_ADDRESS，传输字节数置 0）。
+ *
+ * 注意（用户强调的三点）：
+ *   1. 不只是比较起始地址，必须判断「本次读取范围是否跨入目标区域」，
+ *      因此用 RangesOverlap() 做区间重叠判断。
+ *   2. SourceAddress.VirtualAddress 本身不含 PID —— 想限定「只拦某个进程」，
+ *      必须结合请求发生时的地址空间上下文（当前进程）。这里用
+ *      g_HideMemTargetPid 做可选限定：== 0 表示「任意进程都拦」。
+ *   3. PHYSICAL 与 VIRTUAL 是两种不同语义的源地址，必须分开处理
+ *      （物理地址不能直接当虚拟地址比较，需要先 MmGetVirtualForPhysical 映射）。
+ *
+ * g_HideMemRegionSize == 0 表示未配置 / 关闭 —— Hook 纯透传。
+ */
+static volatile ULONG_PTR g_HideMemRegionStart = 0;
+static volatile ULONG_PTR g_HideMemRegionSize  = 0;
+static volatile ULONG_PTR g_HideMemTargetPid   = 0;
+
+#define MMCOPY_HOOK_LOG_LIMIT 8
+static volatile LONG g_MmCopy_HookHitCount = 0;    /* 命中拦截次数 */
+static volatile LONG g_MmCopy_PhysMissCount = 0;   /* 物理地址无法映射成 VA 的次数 */
+
+/**
+ * @brief 判断「读取区间 [addr, addr+len)」是否与「目标区间 [region, region+size)」重叠
+ * @details 处理了整数溢出：若加法溢出则视为「可能重叠」，返回 TRUE（保守拦截）。
+ *          这是用户强调的第 1 点 —— 必须考虑跨入目标区域，而不只是起始地址。
+ */
+static BOOLEAN RangesOverlap(
+	ULONG_PTR addr, SIZE_T len,
+	ULONG_PTR regionStart, ULONG_PTR regionSize)
+{
+	ULONG_PTR addrEnd;
+	ULONG_PTR regionEnd;
+
+	if (regionSize == 0 || len == 0)
+		return FALSE;
+
+	/* 溢出保护：任一加法溢出，保守认为重叠 */
+	if (addr > MAXULONG_PTR - (ULONG_PTR)len)
+		return TRUE;
+	if (regionStart > MAXULONG_PTR - regionSize)
+		return TRUE;
+
+	addrEnd   = addr + (ULONG_PTR)len;
+	regionEnd = regionStart + regionSize;
+
+	/* 半开区间重叠判定：[addr, addrEnd) ∩ [regionStart, regionEnd) != ∅ */
+	return (addr < regionEnd) && (regionStart < addrEnd);
+}
+
+/**
+ * @brief 设置 MmCopyMemory 隐藏区域（由 usermode 的 IOCTL 调用）
+ * @param ProcessId 可选：只拦截该 PID（当前进程上下文）的请求；0 = 任意进程
+ * @param Start     隐藏区域起始地址
+ * @param Size      隐藏区域大小（字节），0 = 关闭
+ */
+VOID SetMmCopyHideRegion(ULONG ProcessId, ULONG_PTR Start, ULONG_PTR Size)
+{
+	/* 先清 size，避免读到「新 start + 旧 size」的中间态 */
+	g_HideMemRegionSize = 0;
+	g_HideMemTargetPid  = ProcessId;
+	g_HideMemRegionStart = Start;
+	g_HideMemRegionSize  = Size;
+
+	if (Size == 0) {
+		SimpleHvLog("[MmCopy] Hide region CLEARED (interception disabled)");
+	} else {
+		SimpleHvLog("[MmCopy] Hide region SET: pid=%u start=0x%llx size=0x%llx (end=0x%llx)",
+		            ProcessId, (UINT64)Start, (UINT64)Size, (UINT64)(Start + Size));
+	}
+}
 
 VOID ResetTestHooksState(VOID)
 {
 	g_ObpTestHookInstalled = FALSE;
 	g_NtQueryTestHookInstalled = FALSE;
 	g_MiRWM_TestHookInstalled = FALSE;
+	g_MmCopyTestHookInstalled = FALSE;
 	g_MiRWM_HookHitCount = 0;
+	g_MiRWM_WriteBlockCount = 0;
+	g_MmCopy_HookHitCount = 0;
+	g_MmCopy_PhysMissCount = 0;
 	old_ObpReferenceObjectByHandleWithTag = NULL;
 	old_NtQuerySystemInformation = NULL;
-	old_MiReadWriteVirtualMemory = NULL;
+	old_MiCopyVirtualMemory = NULL;
+	old_MmCopyMemory = NULL;
 	SimpleHvLog("[Test] Test-hook state reset after UNHOOK_ALL");
 }
 
 /**
- * @brief 设置 MiRWM 保护范围（由 usermode 的 IOCTL 调用）
+ * @brief 设置保护范围（由 usermode 的 IOCTL 调用）
  * @details 只保护 pid 进程中 [BaseAddress, BaseAddress + Size) 的读取。
+ *          命中范围会被清零；Hook 目标是 MiCopyVirtualMemory
+ *          （NtRead/NtWriteVirtualMemory 与 MmCopyVirtualMemory 的公共底层）。
  *          Size == 0 表示关闭保护（Hook 变回纯透传）。
  *
  * @param ProcessId   目标进程 PID
@@ -370,23 +492,138 @@ NTSTATUS NtQuerySystemInformationHook(
 	return stat;
 }
 
+/*
+ * 拦截 MmCopyMemory 时返回的状态码。
+ * 用户参考实现里用的是 0xC0000018（STATUS_CONFLICTING_ADDRESSES）；
+ * 这里用宏包一层，方便后续想改成 STATUS_INVALID_ADDRESS (0xC0000141)。
+ */
+#define MMCOPY_BLOCK_STATUS ((NTSTATUS)0xC0000018L)
+
+/**
+ * @brief MmCopyMemory Hook 处理函数
+ * @details 拦截「源地址范围与隐藏区域重叠」的内存拷贝：
+ *          - VIRTUAL (0x2) ：直接取 SourceAddress.VirtualAddress，
+ *                            用 RangesOverlap 判断本次读取范围
+ *                            是否跨入隐藏区域；
+ *          - PHYSICAL (0x1)：物理地址不能直接当虚拟地址比较，
+ *                            先用 MmGetVirtualForPhysical 映射成虚拟地址，
+ *                            再判断；映射失败则放行，避免误伤。
+ *          命中时返回 MMCOPY_BLOCK_STATUS 并把 *NumberOfBytesTransferred 置 0。
+ *
+ *          进程身份：SourceAddress.VirtualAddress 不含 PID。若 g_HideMemTargetPid
+ *          非 0，则只在「当前地址空间上下文（当前进程）== 目标 PID」时拦截。
+ */
+NTSTATUS NTAPI MmCopyMemoryHook(
+	PVOID TargetAddress,
+	MM_COPY_ADDRESS SourceAddress,
+	SIZE_T NumberOfBytes,
+	ULONG Flags,
+	PSIZE_T NumberOfBytesTransferred)
+{
+	ULONG_PTR   regionStart;
+	ULONG_PTR   regionSize;
+	ULONG_PTR   address   = 0;
+	ULONG_PTR   curPid;
+	BOOLEAN     blocked   = FALSE;
+	const char* kind      = "?";
+
+	/* trampoline 未就绪（Hook 安装中）：不能调原函数（会死循环） */
+	if (old_MmCopyMemory == NULL)
+		return STATUS_UNSUCCESSFUL;
+
+	regionSize = g_HideMemRegionSize;
+
+	/* 未配置隐藏区域 / 参数无效 -> 纯透传 */
+	if (regionSize == 0 || TargetAddress == NULL || NumberOfBytes == 0) {
+		return old_MmCopyMemory(
+			TargetAddress, SourceAddress, NumberOfBytes, Flags, NumberOfBytesTransferred);
+	}
+
+	regionStart = g_HideMemRegionStart;
+	curPid      = (ULONG_PTR)PsGetCurrentProcessId();
+
+	if (Flags == MM_COPY_MEMORY_VIRTUAL) {
+		kind    = "VIRTUAL";
+		address = (ULONG_PTR)SourceAddress.VirtualAddress;
+
+		/* 进程身份限定：0 表示不限进程；非 0 则要求当前进程匹配 */
+		if (g_HideMemTargetPid == 0 || curPid == g_HideMemTargetPid) {
+			blocked = RangesOverlap(
+				address, NumberOfBytes, regionStart, regionSize);
+		}
+	} else if (Flags == MM_COPY_MEMORY_PHYSICAL) {
+		PVOID va;
+
+		kind = "PHYSICAL";
+		/* 物理地址 -> 虚拟地址映射；映射不到就放行，但记录一下（便于发现绕过尝试） */
+		va = MmGetVirtualForPhysical(SourceAddress.PhysicalAddress);
+		if (va != NULL) {
+			address = (ULONG_PTR)va;
+			if (g_HideMemTargetPid == 0 || curPid == g_HideMemTargetPid) {
+				blocked = RangesOverlap(
+					address, NumberOfBytes, regionStart, regionSize);
+			}
+		} else {
+			ULONG miss = (ULONG)InterlockedIncrement(&g_MmCopy_PhysMissCount);
+			if (miss <= MMCOPY_HOOK_LOG_LIMIT) {
+				SimpleHvLog("[MmCopy Hook] PHYSICAL src=0x%llx maps to no VA "
+				            "(MmGetVirtualForPhysical=NULL) -> passthrough",
+				            (UINT64)SourceAddress.PhysicalAddress.QuadPart);
+			}
+		}
+	}
+
+	if (blocked) {
+		if (NumberOfBytesTransferred) {
+			__try {
+				/* 可能是内核指针，不能 Probe；直接写在 __try 里兜底异常 */
+				*NumberOfBytesTransferred = 0;
+			}
+			__except (EXCEPTION_EXECUTE_HANDLER) {
+				/* 忽略：即使写不进去也不影响拦截结果 */
+			}
+		}
+
+		/* 限流日志：只打印前 MMCOPY_HOOK_LOG_LIMIT 次命中 */
+		{
+			ULONG hit = (ULONG)InterlockedIncrement(&g_MmCopy_HookHitCount);
+			if (hit <= MMCOPY_HOOK_LOG_LIMIT) {
+				SimpleHvLog("[MmCopy Hook] #%u BLOCKED %s src=0x%llx len=0x%llx "
+				            "pid=%llu hits [0x%llx, +0x%llx)",
+				            hit, kind, (UINT64)address, (UINT64)NumberOfBytes,
+				            (UINT64)curPid,
+				            (UINT64)regionStart, (UINT64)regionSize);
+				if (hit == MMCOPY_HOOK_LOG_LIMIT)
+					SimpleHvLog("[MmCopy Hook] log limit reached (%u); further hits silent",
+					            MMCOPY_HOOK_LOG_LIMIT);
+			}
+		}
+
+		return MMCOPY_BLOCK_STATUS;
+	}
+
+	return old_MmCopyMemory(
+		TargetAddress, SourceAddress, NumberOfBytes, Flags, NumberOfBytesTransferred);
+}
+
 // ========================================
 // 导出接口
 // ========================================
 
 /* Forward declarations (defined later in this file) */
-PVOID    ResolveMiReadWriteVirtualMemorySig(VOID);
-NTSTATUS NTAPI FakeMiReadWriteVirtualMemory(
-	HANDLE ProcessHandle, PVOID BaseAddress, PVOID Buffer,
-	SIZE_T BufferSize, PSIZE_T NumberOfBytesRead,
-	ULONG_PTR Arg6, ULONG_PTR Arg7);
+PVOID    ResolveMiCopyVirtualMemory(VOID);
+NTSTATUS NTAPI FakeMiCopyVirtualMemory(
+	PEPROCESS SourceProcess, PVOID SourceAddress, PEPROCESS TargetProcess,
+	PVOID TargetAddress, SIZE_T BufferSize,
+	KPROCESSOR_MODE PreviousMode, PSIZE_T ReturnSize);
 
 /**
  * @brief 安装所有测试 Hooks
  * @details 安装以下 EPT Hooks：
  *          1. ObpReferenceObjectByHandleWithTag - 保护指定进程不被打开
  *          2. NtQuerySystemInformation - 隐藏指定进程
- *          3. MiReadWriteVirtualMemory - 拦截跨进程内存读写（特征码扫描定位）
+ *          3. MiCopyVirtualMemory - 拦截跨进程内存读写（从 MmCopyVirtualMemory 反汇编定位）
+ *          4. MmCopyMemory - 拦截直接内存拷贝（导出函数，隐藏区域命中即阻断）
  * @return NTSTATUS 成功返回 STATUS_SUCCESS，失败返回相应错误码
  * @note 必须在 VMX non-root mode 下调用（从安装测试 Hook 的 IOCTL 调用）
  */
@@ -394,7 +631,8 @@ NTSTATUS InstallTestHooks(VOID)
 {
 	PVOID pObpReferenceObjectByHandleWithTag;
 	PVOID pNtQuerySystemInformation;
-	PVOID pMiRWM = NULL;
+	PVOID pMiCopy = NULL;
+	PVOID pMmCopyMemory = NULL;
 	BOOLEAN result;
 	UINT32 coreId;
 	UINT32 processId;
@@ -491,7 +729,7 @@ NTSTATUS InstallTestHooks(VOID)
 	//);
 	if (g_NtQueryTestHookInstalled) {
 		SimpleHvLog("[Test] Hook 2 already installed; trampoline=%p", old_NtQuerySystemInformation);
-		goto hooks_installed;
+		goto install_hook_3;
 	}
 	result = ConfigureEptHook2(coreId,
 	                            pNtQuerySystemInformation,
@@ -522,66 +760,122 @@ NTSTATUS InstallTestHooks(VOID)
 
 
 	// ========================================
-	// 3b. Hook MiReadWriteVirtualMemory (via signature scan)
+	// 3b. Hook MiCopyVirtualMemory
 	// ========================================
+	install_hook_3:
 	/*
-	 * MiReadWriteVirtualMemory is the internal function that both
-	 * NtReadVirtualMemory and NtWriteVirtualMemory call to perform
-	 * the actual cross-process memory copy.  Hooking this single
-	 * function intercepts ALL cross-process read/write operations,
-	 * which is more efficient than hooking the two Nt wrappers.
+	 * MiCopyVirtualMemory 是跨进程内存拷贝的底层公共函数：
+	 *   NtRead/NtWriteVirtualMemory -> MiReadWriteVirtualMemory -> MiCopyVirtualMemory
+	 *   MmCopyVirtualMemory (导出)                              -> MiCopyVirtualMemory
+	 * Hook 它一处即可覆盖以上全部路径。
 	 *
-	 * We locate it via signature scanning rather than MmGetSystemRoutineAddress
-	 * (it is not exported) or the E8-call-from-NtReadVirtualMemory trick
-	 * (brittle on different builds).
+	 * 定位方式：MmCopyVirtualMemory 是导出的包装函数，反汇编其入口处的
+	 * 相对 call/jmp 即可得到 MiCopyVirtualMemory —— 不再依赖 IDA 特征码扫描。
 	 */
 	if (g_MiRWM_TestHookInstalled) {
 		SimpleHvLog("[Test] Hook 3 already installed; trampoline=%p",
-			old_MiReadWriteVirtualMemory);
-		goto hooks_installed;
+			old_MiCopyVirtualMemory);
+		goto install_hook_4;
 	}
 
-	pMiRWM = ResolveMiReadWriteVirtualMemorySig();
-	if (!pMiRWM) {
-		SimpleHvLogError("[Test] Failed to find MiReadWriteVirtualMemory via signature scan");
-		/* Non-fatal: the other two hooks are still useful */
-		goto hooks_installed;
+	pMiCopy = ResolveMiCopyVirtualMemory();
+	if (!pMiCopy) {
+		SimpleHvLogError("[Test] Failed to resolve MiCopyVirtualMemory from MmCopyVirtualMemory");
+		/* Non-fatal: the other hooks are still useful */
+		goto install_hook_4;
 	}
 
 	coreId = KeGetCurrentProcessorNumberEx(NULL);
 	processId = HANDLE_TO_UINT32(PsGetCurrentProcessId());
 	SimpleHvLog("[Test] Hook 3 request: core=%u pid=%u IRQL=%u target=%p handler=%p pageOffset=0x%Ix",
-	            coreId, processId, KeGetCurrentIrql(), pMiRWM,
-	            FakeMiReadWriteVirtualMemory,
-	            (SIZE_T)pMiRWM & (PAGE_SIZE - 1));
+	            coreId, processId, KeGetCurrentIrql(), pMiCopy,
+	            FakeMiCopyVirtualMemory,
+	            (SIZE_T)pMiCopy & (PAGE_SIZE - 1));
 
 	result = ConfigureEptHook2(coreId,
-	                           pMiRWM,
-	                           (PVOID)FakeMiReadWriteVirtualMemory,
+	                           pMiCopy,
+	                           (PVOID)FakeMiCopyVirtualMemory,
 	                           processId,
-	                           (PVOID *)&old_MiReadWriteVirtualMemory);
+	                           (PVOID *)&old_MiCopyVirtualMemory);
 	if (result) {
-		SimpleHvLog("[Test] Hook 3 installed: MiReadWriteVirtualMemory");
-		SimpleHvLog("[Test]   target     = 0x%llx", (UINT64)pMiRWM);
-		SimpleHvLog("[Test]   trampoline = 0x%llx", (UINT64)old_MiReadWriteVirtualMemory);
+		SimpleHvLog("[Test] Hook 3 installed: MiCopyVirtualMemory");
+		SimpleHvLog("[Test]   target     = 0x%llx", (UINT64)pMiCopy);
+		SimpleHvLog("[Test]   trampoline = 0x%llx", (UINT64)old_MiCopyVirtualMemory);
 
-		if (old_MiReadWriteVirtualMemory == NULL) {
+		if (old_MiCopyVirtualMemory == NULL) {
 			SimpleHvLogError("[Test] ERROR: Hook 3 Trampoline is NULL!");
 			return STATUS_UNSUCCESSFUL;
 		}
 
-		if ((UINT64)old_MiReadWriteVirtualMemory < 0xFFFF000000000000) {
+		if ((UINT64)old_MiCopyVirtualMemory < 0xFFFF000000000000) {
 			SimpleHvLogError("[Test] ERROR: Hook 3 Trampoline address looks invalid: 0x%llx",
-				old_MiReadWriteVirtualMemory);
+				old_MiCopyVirtualMemory);
 			return STATUS_UNSUCCESSFUL;
 		}
 		g_MiRWM_TestHookInstalled = TRUE;
 	} else {
 		SimpleHvLogError("[Test] Failed to install Hook 3: core=%u pid=%u target=%p handler=%p trampoline=%p",
-		                 coreId, processId, pMiRWM,
-		                 FakeMiReadWriteVirtualMemory, old_MiReadWriteVirtualMemory);
-		SimpleHvLogWarning("[Test] Hook 3 (MiReadWriteVirtualMemory) NOT installed; "
-		                   "hooks 1/2 remain active");
+		                 coreId, processId, pMiCopy,
+		                 FakeMiCopyVirtualMemory, old_MiCopyVirtualMemory);
+		SimpleHvLogWarning("[Test] Hook 3 (MiCopyVirtualMemory) NOT installed; "
+		                   "other hooks remain active");
+	}
+
+	install_hook_4:
+	// ========================================
+	// 3c. Hook MmCopyMemory (exported kernel routine)
+	// ========================================
+	/*
+	 * MmCopyMemory 是 ntoskrnl 导出的内存拷贝例程，可直接用
+	 * MmGetSystemRoutineAddress 定位。很多驱动/工具用它读物理内存或
+	 * 内核内存来绕过 NtReadVirtualMemory，hook 它可以补齐这一类访问。
+	 */
+	if (g_MmCopyTestHookInstalled) {
+		SimpleHvLog("[Test] Hook 4 already installed; trampoline=%p", old_MmCopyMemory);
+		goto hooks_installed;
+	}
+
+	RtlInitUnicodeString(&routineName, L"MmCopyMemory");
+	pMmCopyMemory = MmGetSystemRoutineAddress(&routineName);
+	if (!pMmCopyMemory) {
+		SimpleHvLogError("[Test] Failed to find MmCopyMemory (exported)");
+		goto hooks_installed;
+	}
+
+	SimpleHvLog("[Test] MmCopyMemory: 0x%llx", pMmCopyMemory);
+	coreId = KeGetCurrentProcessorNumberEx(NULL);
+	processId = HANDLE_TO_UINT32(PsGetCurrentProcessId());
+	SimpleHvLog("[Test] Hook 4 request: core=%u pid=%u IRQL=%u target=%p handler=%p pageOffset=0x%Ix",
+	            coreId, processId, KeGetCurrentIrql(), pMmCopyMemory,
+	            MmCopyMemoryHook,
+	            (SIZE_T)pMmCopyMemory & (PAGE_SIZE - 1));
+
+	result = ConfigureEptHook2(coreId,
+	                           pMmCopyMemory,
+	                           (PVOID)MmCopyMemoryHook,
+	                           processId,
+	                           (PVOID *)&old_MmCopyMemory);
+	if (result) {
+		SimpleHvLog("[Test] Hook 4 installed: MmCopyMemory");
+		SimpleHvLog("[Test]   target     = 0x%llx", (UINT64)pMmCopyMemory);
+		SimpleHvLog("[Test]   trampoline = 0x%llx", (UINT64)old_MmCopyMemory);
+
+		if (old_MmCopyMemory == NULL) {
+			SimpleHvLogError("[Test] ERROR: Hook 4 Trampoline is NULL!");
+			return STATUS_UNSUCCESSFUL;
+		}
+
+		if ((UINT64)old_MmCopyMemory < 0xFFFF000000000000) {
+			SimpleHvLogError("[Test] ERROR: Hook 4 Trampoline address looks invalid: 0x%llx",
+				old_MmCopyMemory);
+			return STATUS_UNSUCCESSFUL;
+		}
+		g_MmCopyTestHookInstalled = TRUE;
+	} else {
+		SimpleHvLogError("[Test] Failed to install Hook 4: core=%u pid=%u target=%p handler=%p trampoline=%p",
+		                 coreId, processId, pMmCopyMemory,
+		                 MmCopyMemoryHook, old_MmCopyMemory);
+		SimpleHvLogWarning("[Test] Hook 4 (MmCopyMemory) NOT installed; other hooks remain active");
 	}
 
 	hooks_installed:
@@ -594,14 +888,18 @@ NTSTATUS InstallTestHooks(VOID)
 	            g_ObpTestHookInstalled ? "OK" : "--");
 	SimpleHvLog("[Test]   [%s] 2. NtQuerySystemInformation",
 	            g_NtQueryTestHookInstalled ? "OK" : "--");
-	SimpleHvLog("[Test]   [%s] 3. MiReadWriteVirtualMemory",
+	SimpleHvLog("[Test]   [%s] 3. MiCopyVirtualMemory",
 	            g_MiRWM_TestHookInstalled ? "OK" : "--");
+	SimpleHvLog("[Test]   [%s] 4. MmCopyMemory",
+	            g_MmCopyTestHookInstalled ? "OK" : "--");
 	SimpleHvLog("[Test] Protected processes:");
 	for (i = 0; i < sizeof(protected_process_list) / sizeof(PCWCH); i++) {
 		SimpleHvLog("[Test]   - %ws", protected_process_list[i]);
 	}
 	SimpleHvLog("[Test] MiRWM runtime hit logs throttled to first %u hits",
 	            MIRWM_HOOK_LOG_LIMIT);
+	SimpleHvLog("[Test] MmCopy runtime hit logs throttled to first %u hits",
+	            MMCOPY_HOOK_LOG_LIMIT);
 	SimpleHvLog("========================================");
 
 	return STATUS_SUCCESS;
@@ -610,458 +908,311 @@ NTSTATUS InstallTestHooks(VOID)
 
 
 // ========================================
-// Signature Scanning for MiReadWriteVirtualMemory
+// Resolving MiCopyVirtualMemory (via exported MmCopyVirtualMemory)
 // ========================================
 
 /*
- * Signature (at 14093B450):
- *   48 89 5C 24 ?  48 89 74 24 ?  4C 89 44 24 ?  48 89 54 24 ?
- *   57 41 54 41 55 41 56 41 57 48 83 EC
+ * MiCopyVirtualMemory 未导出，但 MmCopyVirtualMemory 是它的导出包装：
+ *     MmCopyVirtualMemory 内部必然有一条相对 call/jmp 跳进 MiCopyVirtualMemory。
+ * 因此用 Zydis 反汇编 MmCopyVirtualMemory 入口处的若干条指令，取其中第一条
+ * 「目标落在内核空间的相对 call/jmp」即为 MiCopyVirtualMemory。
  *
- * Disassembled prologue:
- *   mov [rsp+??], rbx    ; 48 89 5C 24 ??
- *   mov [rsp+??], rsi    ; 48 89 74 24 ??
- *   mov [rsp+??], r8     ; 4C 89 44 24 ??
- *   mov [rsp+??], rdx    ; 48 89 54 24 ??
- *   push rdi             ; 57
- *   push r12             ; 41 54
- *   push r13             ; 41 55
- *   push r14             ; 41 56
- *   push r15             ; 41 57
- *   sub rsp, ??          ; 48 83 EC ??
- *
- * 32 bytes total, 4 wildcards (at offsets 4, 9, 14, 19)
+ * 相比 IDA 特征码扫描：不依赖具体版本的字节序列，跨版本更稳，也不用手工维护通配符。
  */
 
-static const UINT8 g_MiRWM_Signature[] = {
-	0x48, 0x89, 0x5C, 0x24, 0x00, /* ? */  /* 0-4  */
-	0x48, 0x89, 0x74, 0x24, 0x00, /* ? */  /* 5-9  */
-	0x4C, 0x89, 0x44, 0x24, 0x00, /* ? */  /* 10-14 */
-	0x48, 0x89, 0x54, 0x24, 0x00, /* ? */  /* 15-19 */
-	0x57, 0x41, 0x54, 0x41, 0x55,           /* 20-24 */
-	0x41, 0x56, 0x41, 0x57, 0x48, 0x83, 0xEC  /* 25-31 */
-};
-static const SIZE_T g_MiRWM_SigLen = sizeof(g_MiRWM_Signature);
-
-/* Mask: TRUE = must match, FALSE = wildcard */
-static const BOOLEAN g_MiRWM_Mask[] = {
-	TRUE, TRUE, TRUE, TRUE, FALSE,            /* xxxx? */
-	TRUE, TRUE, TRUE, TRUE, FALSE,            /* xxxx? */
-	TRUE, TRUE, TRUE, TRUE, FALSE,            /* xxxx? */
-	TRUE, TRUE, TRUE, TRUE, FALSE,            /* xxxx? */
-	TRUE, TRUE, TRUE, TRUE, TRUE,             /* xxxxx */
-	TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE  /* xxxxxxx */
-};
+#define MICOPY_DISASM_SCAN_LEN 0x60   /* 反汇编 MmCopyVirtualMemory 入口前 0x60 字节 */
 
 /**
- * @brief Pattern match with wildcard support
- * @param base     Start of memory region to scan
- * @param size     Size of region
- * @param pattern  Byte pattern to match
- * @param mask    Mask array (TRUE = match, FALSE = wildcard)
- * @param patLen  Length of pattern
- * @return Pointer to first match, or NULL
+ * @brief 反汇编 functionAddr 起始的 scanLen 字节，返回第一条指向内核空间的相对 call/jmp 目标
+ * @param functionAddr 函数入口
+ * @param scanLen      扫描字节数
+ * @return 目标地址；未找到返回 NULL
  */
-static PVOID MiRWM_FindPattern(
-	PUCHAR base, SIZE_T size,
-	const UINT8* pattern, const BOOLEAN* mask, SIZE_T patLen)
+static PVOID MiCopy_FindRelativeCallTarget(PVOID functionAddr, SIZE_T scanLen)
 {
-	if (!base || !pattern || !mask || patLen == 0 || size < patLen)
+	ZydisDecoder            decoder;
+	ZydisDecodedInstruction instruction;
+	ZydisDecodedOperand     operands[ZYDIS_MAX_OPERAND_COUNT];
+	SIZE_T                  offset = 0;
+
+	if (functionAddr == NULL || scanLen == 0)
 		return NULL;
 
-	SIZE_T endPos = size - patLen;
-	for (SIZE_T i = 0; i <= endPos; i++) {
-		BOOLEAN match = TRUE;
-		for (SIZE_T j = 0; j < patLen; j++) {
-			if (mask[j] && base[i + j] != pattern[j]) {
-				match = FALSE;
-				break;
+	if (!ZYAN_SUCCESS(ZydisDecoderInit(&decoder,
+	                                   ZYDIS_MACHINE_MODE_LONG_64,
+	                                   ZYDIS_STACK_WIDTH_64))) {
+		SimpleHvLogError("[MiCopy] ZydisDecoderInit failed");
+		return NULL;
+	}
+
+	while (offset < scanLen) {
+		ZyanStatus status = ZydisDecoderDecodeFull(
+			&decoder,
+			(PVOID)((PUCHAR)functionAddr + offset),
+			scanLen - offset,
+			&instruction,
+			operands);
+
+		if (!ZYAN_SUCCESS(status)) {
+			/* 解码失败：按字节滑动，跳过可疑字节后继续 */
+			offset++;
+			continue;
+		}
+
+		/* 只看相对寻址的 call / jmp（x64 下即 E8 / E9） */
+		if ((instruction.mnemonic == ZYDIS_MNEMONIC_CALL ||
+		     instruction.mnemonic == ZYDIS_MNEMONIC_JMP) &&
+		    instruction.operand_count >= 1 &&
+		    operands[0].type == ZYDIS_OPERAND_TYPE_IMMEDIATE &&
+		    operands[0].imm.is_relative) {
+
+			ULONG_PTR instrAddr = (ULONG_PTR)functionAddr + offset;
+			ULONG_PTR target    = instrAddr + instruction.length +
+			                      (ULONG_PTR)(INT64)operands[0].imm.value.s;
+
+			SimpleHvLog("[MiCopy]   +0x%Ix %s -> 0x%llx",
+			            offset,
+			            (instruction.mnemonic == ZYDIS_MNEMONIC_CALL) ? "call" : "jmp",
+			            (UINT64)target);
+
+			/* 目标必须在内核空间，且不能是自身 */
+			if (target >= 0xFFFF000000000000ULL &&
+			    target != (ULONG_PTR)functionAddr) {
+				return (PVOID)target;
 			}
 		}
-		if (match)
-			return (PVOID)(base + i);
+
+		offset += instruction.length;
 	}
+
 	return NULL;
 }
 
 /**
- * @brief Get the ntoskrnl base address via ZwQuerySystemInformation
- * @details The reported ImageSize may be only ~3.5MB on some builds,
- *          which is NOT sufficient as a scan range. Callers should
- *          parse PE section headers instead.
+ * @brief 解析 MiCopyVirtualMemory 地址（从导出函数 MmCopyVirtualMemory 反汇编 call 得到）
+ * @details 不再使用 IDA 特征码扫描。
+ * @return MiCopyVirtualMemory 地址；失败返回 NULL
  */
-static PVOID MiRWM_GetKernelBase(PULONG pReportedImageSize)
+PVOID ResolveMiCopyVirtualMemory(VOID)
 {
-	typedef NTSTATUS(NTAPI* fnZwQuerySystemInformation)(
-		ULONG, PVOID, ULONG, PULONG);
+	UNICODE_STRING routineName = RTL_CONSTANT_STRING(L"MmCopyVirtualMemory");
+	PVOID          pMmCopyVirtualMemory;
+	PVOID          pMiCopyVirtualMemory;
 
-	UNICODE_STRING routineName = RTL_CONSTANT_STRING(L"ZwQuerySystemInformation");
-	fnZwQuerySystemInformation pZwQSI =
-		(fnZwQuerySystemInformation)MmGetSystemRoutineAddress(&routineName);
-	if (!pZwQSI) {
-		SimpleHvLogError("[MiRWM] ZwQuerySystemInformation not found");
+	SimpleHvLog("[MiCopy] ===== Resolving MiCopyVirtualMemory (from MmCopyVirtualMemory) =====");
+
+	pMmCopyVirtualMemory = MmGetSystemRoutineAddress(&routineName);
+	if (!pMmCopyVirtualMemory) {
+		SimpleHvLogError("[MiCopy] FAILED: MmCopyVirtualMemory is not exported");
 		return NULL;
 	}
-	SimpleHvLog("[MiRWM] ZwQuerySystemInformation @ 0x%llx", (UINT64)pZwQSI);
+	SimpleHvLog("[MiCopy] MmCopyVirtualMemory (exported) = 0x%llx",
+	            (UINT64)pMmCopyVirtualMemory);
 
-	ULONG returnLength = 0;
-	NTSTATUS status = pZwQSI(SystemModuleInformation, NULL, 0, &returnLength);
-	if (status != STATUS_INFO_LENGTH_MISMATCH || returnLength == 0) {
-		SimpleHvLogError("[MiRWM] Failed to get module info size: 0x%x", status);
-		return NULL;
-	}
-	SimpleHvLog("[MiRWM] Module info buffer size: %u bytes", returnLength);
+	/* 反汇编入口前若干字节，打印每条相对 call/jmp，取第一条落在内核空间的 */
+	pMiCopyVirtualMemory = MiCopy_FindRelativeCallTarget(
+		pMmCopyVirtualMemory, MICOPY_DISASM_SCAN_LEN);
 
-	PVOID buffer = PlatformMemAllocateZeroedNonPagedPool(returnLength);
-	if (!buffer) {
-		SimpleHvLogError("[MiRWM] Failed to allocate %u bytes for module info", returnLength);
-		return NULL;
-	}
-
-	status = pZwQSI(SystemModuleInformation, buffer, returnLength, &returnLength);
-	if (!NT_SUCCESS(status)) {
-		SimpleHvLogError("[MiRWM] Failed to query module info: 0x%x", status);
-		PlatformMemFreePool(buffer);
+	if (!pMiCopyVirtualMemory) {
+		SimpleHvLogError("[MiCopy] FAILED: no relative call/jmp to kernel space found "
+		                 "in the first 0x%x bytes of MmCopyVirtualMemory",
+		                 MICOPY_DISASM_SCAN_LEN);
 		return NULL;
 	}
 
-	PSYSTEM_MODULE_INFORMATION modInfo = (PSYSTEM_MODULE_INFORMATION)buffer;
-	PVOID kernelBase = NULL;
-	ULONG imageSize = 0;
-
-	if (modInfo->Count > 0) {
-		kernelBase  = modInfo->Module[0].ImageBase;
-		imageSize   = modInfo->Module[0].ImageSize;
-		SimpleHvLog("[MiRWM] Module count: %u", modInfo->Count);
-		SimpleHvLog("[MiRWM] Module[0] '%s' base=0x%llx reportedImageSize=0x%x (%u bytes)",
-			modInfo->Module[0].FullPathName, (UINT64)kernelBase, imageSize, imageSize);
-	} else {
-		SimpleHvLogError("[MiRWM] Module info count is 0");
-	}
-
-	if (pReportedImageSize)
-		*pReportedImageSize = imageSize;
-
-	PlatformMemFreePool(buffer);
-	return kernelBase;
+	SimpleHvLog("[MiCopy] ===== RESOLVED =====");
+	SimpleHvLog("[MiCopy]   MiCopyVirtualMemory              = 0x%llx",
+	            (UINT64)pMiCopyVirtualMemory);
+	SimpleHvLog("[MiCopy]   offset from MmCopyVirtualMemory  = +0x%llx",
+	            (UINT64)((PUCHAR)pMiCopyVirtualMemory - (PUCHAR)pMmCopyVirtualMemory));
+	return pMiCopyVirtualMemory;
 }
+
+// ========================================
+// Hook Handler: MiCopyVirtualMemory
+// ========================================
 
 /*
- * PE 结构体的原始偏移（避免引入 ntimage.h，PIMAGE_NT_HEADERS 在
- * 内核编译环境下会带来一堆头文件依赖问题，这里直接按偏移读取）。
- *
- * IMAGE_DOS_HEADER:
- *   0x3C  e_lfanew            -> 指向 IMAGE_NT_HEADERS
- *
- * IMAGE_NT_HEADERS:
- *   0x00  Signature           (== 0x00004550 "PE\0\0")
- *   0x06  FileHeader.NumberOfSections          (USHORT)
- *   0x14  FileHeader.SizeOfOptionalHeader      (USHORT)
- *   0x18  OptionalHeader                       (起始)
- *
- * IMAGE_OPTIONAL_HEADER:
- *   0x10  AddressOfEntryPoint (相对 OptionalHeader)
- *   0x38  SizeOfImage         (相对 OptionalHeader)
- *
- * IMAGE_SECTION_HEADER (每个 40 字节):
- *   0x08  Misc.VirtualSize
- *   0x0C  VirtualAddress
+ * 写入命中保护范围时返回的状态码（直接拦截、不执行拷贝）。
+ * 用宏包一层，方便改成 STATUS_INVALID_ADDRESS (0xC0000141) 等其它码。
  */
-#define PE_DOS_LFANEW_OFFSET        0x3C
-#define PE_NT_SIGNATURE             0x00004550
-#define PE_NT_NUMSECTIONS_OFFSET    0x06
-#define PE_NT_SIZEOFOPT_OFFSET      0x14
-#define PE_NT_OPT_OFFSET            0x18
-#define PE_OPT_ENTRYPOINT_OFFSET    (PE_NT_OPT_OFFSET + 0x10)  /* 0x28 */
-#define PE_OPT_SIZEOFIMAGE_OFFSET   (PE_NT_OPT_OFFSET + 0x38)  /* 0x50 */
-#define PE_SECTION_SIZE             40
-#define PE_SECTION_VIRTUALSIZE      0x08
-#define PE_SECTION_VIRTUALADDR      0x0C
+#define MICOPY_WRITE_BLOCK_STATUS ((NTSTATUS)0xC0000022L)   /* STATUS_ACCESS_DENIED */
 
 /**
- * @brief 打印一段内存的前 16 字节（HEX），用于人工核对特征码是否命中正确
- * @details 手工拼字符串，避免依赖 ntstrsafe.h 等额外头文件
- */
-static VOID MiRWM_LogBytes(const char* tag, PUCHAR addr)
-{
-	static const char hex[] = "0123456789ABCDEF";
-	char buf[3 * 16 + 1];
-	int  i;
-
-	for (i = 0; i < 16; i++) {
-		UCHAR b = addr[i];
-		buf[i * 3 + 0] = hex[(b >> 4) & 0xF];
-		buf[i * 3 + 1] = hex[b & 0xF];
-		buf[i * 3 + 2] = (i == 15) ? '\0' : ' ';
-	}
-
-	SimpleHvLog("[MiRWM] %s @0x%llx: %s", tag, (UINT64)addr, buf);
-}
-
-/**
- * @brief Resolve MiReadWriteVirtualMemory via signature scanning
- * @details 直接按原始偏移解析 ntoskrnl 的 PE 头（不使用 PIMAGE_NT_HEADERS /
- *          RtlImageNtHeader / IMAGE_FIRST_SECTION，避免 ntimage.h 依赖），
- *          先扫描 .text 段，若失败再从内核基址扫描较大范围。
- *          之所以要 fallback：某些版本上报的 ImageSize 只有 ~3.5MB，
- *          不足以覆盖整个 .text。
- * @return MiReadWriteVirtualMemory 地址，未找到返回 NULL
- */
-PVOID ResolveMiReadWriteVirtualMemorySig(VOID)
-{
-	ULONG   reportedImageSize = 0;
-	PVOID   kernelBase;
-	PUCHAR  base;
-	PVOID   found = NULL;
-	BOOLEAN isText = FALSE;          /* 是否命中 .text 段 */
-	BOOLEAN foundInText = FALSE;     /* 结果是否来自 .text 扫描 */
-
-	SimpleHvLog("[MiRWM] ===== Resolving MiReadWriteVirtualMemory (signature scan) =====");
-
-	kernelBase = MiRWM_GetKernelBase(&reportedImageSize);
-	if (!kernelBase) {
-		SimpleHvLogError("[MiRWM] FAILED: cannot get kernel base address");
-		return NULL;
-	}
-
-	base = (PUCHAR)kernelBase;
-
-	/* ---- Pass 1: 手动解析 PE，扫描 .text 段 ---- */
-	__try
-	{
-		ULONG e_lfanew = *(PULONG)(base + PE_DOS_LFANEW_OFFSET);
-		PUCHAR nt;
-		ULONG  ntSig;
-		USHORT numSections;
-		USHORT sizeOfOptional;
-		ULONG  sizeOfImage;
-		ULONG  entryPoint;
-		PUCHAR sectionBase;
-		USHORT i;
-
-		if (e_lfanew == 0 || e_lfanew > 0x1000) {
-			SimpleHvLogError("[MiRWM] FAILED: bad e_lfanew = 0x%x", e_lfanew);
-			return NULL;
-		}
-
-		nt = base + e_lfanew;
-		ntSig = *(PULONG)nt;
-		if (ntSig != PE_NT_SIGNATURE) {
-			SimpleHvLogError("[MiRWM] FAILED: bad NT signature = 0x%08x (expect 0x%08x)",
-			                 ntSig, PE_NT_SIGNATURE);
-			return NULL;
-		}
-
-		numSections    = *(PUSHORT)(nt + PE_NT_NUMSECTIONS_OFFSET);
-		sizeOfOptional = *(PUSHORT)(nt + PE_NT_SIZEOFOPT_OFFSET);
-		sizeOfImage    = *(PULONG)(nt + PE_OPT_SIZEOFIMAGE_OFFSET);
-		entryPoint     = *(PULONG)(nt + PE_OPT_ENTRYPOINT_OFFSET);
-
-		SimpleHvLog("[MiRWM] PE OK: e_lfanew=0x%x sections=%u optHdr=0x%x "
-		            "SizeOfImage=0x%x EntryPoint=0x%x (reportedSize=0x%x)",
-		            e_lfanew, numSections, sizeOfOptional,
-		            sizeOfImage, entryPoint, reportedImageSize);
-
-		sectionBase = nt + PE_NT_OPT_OFFSET + sizeOfOptional;
-
-		/* 遍历段表：打印每段信息，并记录 .text 段 */
-		for (i = 0; i < numSections; i++) {
-			PUCHAR s = sectionBase + (SIZE_T)i * PE_SECTION_SIZE;
-			ULONG  va    = *(PULONG)(s + PE_SECTION_VIRTUALADDR);
-			ULONG  vsize = *(PULONG)(s + PE_SECTION_VIRTUALSIZE);
-
-			SimpleHvLog("[MiRWM]   section[%u] '%.8s' VA=0x%x VSize=0x%x",
-			            i, s, va, vsize);
-
-			if (!isText &&
-			    s[0] == '.' && s[1] == 't' && s[2] == 'e' && s[3] == 'x' && s[4] == 't') {
-				isText = TRUE;
-				SimpleHvLog("[MiRWM] Scanning .text: start=0x%llx size=0x%x",
-				            (UINT64)(base + va), vsize);
-				found = MiRWM_FindPattern(base + va, (SIZE_T)vsize,
-				                          g_MiRWM_Signature, g_MiRWM_Mask, g_MiRWM_SigLen);
-			}
-		}
-
-		if (!isText) {
-			SimpleHvLogWarning("[MiRWM] No .text section found in PE headers");
-		}
-	}
-	__except (EXCEPTION_EXECUTE_HANDLER)
-	{
-		SimpleHvLogError("[MiRWM] Exception parsing PE headers: 0x%x", GetExceptionCode());
-	}
-
-	if (found) {
-		foundInText = TRUE;
-	} else if (isText) {
-		SimpleHvLog("[MiRWM] Not found in .text section, trying extended scan...");
-	}
-
-	/* ---- Pass 2: fallback，从内核基址扫描较大范围 ---- */
-	if (!found) {
-		SIZE_T scanRange = (SIZE_T)reportedImageSize;
-		if (scanRange < 0x1000000)
-			scanRange = 0x1000000;  /* 至少 16MB，覆盖上报过小的情况 */
-
-		SimpleHvLog("[MiRWM] Extended scan: base=0x%llx range=0x%llx",
-		            (UINT64)base, (UINT64)scanRange);
-
-		__try
-		{
-			found = MiRWM_FindPattern(base, scanRange,
-			                          g_MiRWM_Signature, g_MiRWM_Mask, g_MiRWM_SigLen);
-		}
-		__except (EXCEPTION_EXECUTE_HANDLER)
-		{
-			SimpleHvLogError("[MiRWM] Exception during extended scan: 0x%x", GetExceptionCode());
-		}
-	}
-
-	if (found) {
-		SimpleHvLog("[MiRWM] ===== RESOLVED =====");
-		SimpleHvLog("[MiRWM]   MiReadWriteVirtualMemory = 0x%llx", (UINT64)found);
-		SimpleHvLog("[MiRWM]   offset from kernel base   = +0x%llx",
-		            (UINT64)((PUCHAR)found - base));
-		SimpleHvLog("[MiRWM]   located via               = %s",
-		            foundInText ? ".text section" : "extended scan");
-		MiRWM_LogBytes("matched bytes", (PUCHAR)found);
-	} else {
-		SimpleHvLogError("[MiRWM] ===== FAILED: signature not found in kernel image =====");
-	}
-
-	return found;
-}
-
-// ========================================
-// Hook Handler: MiReadWriteVirtualMemory
-// ========================================
-
-/**
- * @brief Hook handler for MiReadWriteVirtualMemory
- * @details 只保护「指定 PID 进程中某模块地址范围」的读取：
- *          1. 先透传调用原函数（7 个参数全部原样传递）；
- *          2. 若配置了保护范围，且目标进程 PID 匹配；
- *          3. 计算本次读取范围与保护范围的交集，只把交集那一段清零。
+ * @brief Hook handler for MiCopyVirtualMemory
+ * @details 保护「指定 PID 进程中某模块地址范围」的内存，读写两个方向分别处理：
+ *
+ *          - 写入方向（写入方是别人，且 TargetProcess == 被保护进程、
+ *            TargetAddress 命中范围）：
+ *            **在调用原函数之前直接拦截**，返回 MICOPY_WRITE_BLOCK_STATUS，
+ *            并把 *ReturnSize 置 0 —— 写入一旦放行就无法收回，必须提前拒绝。
+ *
+ *          - 读取方向（读取方是别人，且 SourceProcess == 被保护进程、
+ *            SourceAddress 命中范围）：
+ *            先透传调用原函数完成拷贝，再把「读取范围 ∩ 保护范围」那一段
+ *            在调用方目标缓冲区里清零。
+ *
+ *          MiCopyVirtualMemory 是通用拷贝，方向由「目标进程」决定：
+ *            读：Source = 被读进程，Target = 调用方
+ *            写：Source = 调用方，  Target = 被写进程
+ *
+ *          「自己人」放行：SourceProcess == TargetProcess（被保护进程读写自己的
+ *          内存）时不拦截、不清零 —— 否则会破坏它自身的数据。
  *
  *          未配置保护范围（Size==0）时纯透传，对系统零影响。
  *
- * @param ProcessHandle    目标进程句柄
- * @param BaseAddress      目标进程内的读取基址
- * @param Buffer           调用方的输出缓冲区
- * @param BufferSize       请求字节数
- * @param NumberOfBytesRead 可选，返回实际传输字节数
- * @param Arg6             第 6 个参数（各版本含义不同：DesiredAccess 或 PreviousMode），原样透传
- * @param Arg7             第 7 个参数（仅新版存在），必须原样透传
+ * @param SourceProcess  源进程（从它读 / 写入时是调用方）
+ * @param SourceAddress  源地址
+ * @param TargetProcess  目标进程（写到它 / 读取时是调用方）
+ * @param TargetAddress  目标地址
+ * @param BufferSize     请求字节数
+ * @param PreviousMode   KernelMode / UserMode
+ * @param ReturnSize     可选，返回实际拷贝字节数
  */
-NTSTATUS NTAPI FakeMiReadWriteVirtualMemory(
-	HANDLE ProcessHandle,
-	PVOID BaseAddress,
-	PVOID Buffer,
+NTSTATUS NTAPI FakeMiCopyVirtualMemory(
+	PEPROCESS SourceProcess,
+	PVOID SourceAddress,
+	PEPROCESS TargetProcess,
+	PVOID TargetAddress,
 	SIZE_T BufferSize,
-	PSIZE_T NumberOfBytesRead,
-	ULONG_PTR Arg6,
-	ULONG_PTR Arg7)
+	KPROCESSOR_MODE PreviousMode,
+	PSIZE_T ReturnSize)
 {
 	NTSTATUS  result;
-	PEPROCESS targetProcess = NULL;
 	ULONG_PTR protBase;
 	ULONG_PTR protSize;
 	ULONG_PTR bytesTransferred;
 	BOOLEAN   haveByteCount;
 	ULONG     targetPid;
-	KPROCESSOR_MODE prevMode;
 
 	/* trampoline 未就绪：不能调原函数（会死循环），直接返回错误 */
-	if (old_MiReadWriteVirtualMemory == NULL)
+	if (old_MiCopyVirtualMemory == NULL)
 		return STATUS_INVALID_DEVICE_STATE;
 
 	protSize = g_MiRWM_ProtectSize;
 
 	/*
 	 * 未配置保护范围 -> 纯透传。
-	 * 注意：即使不拦截，也必须把 7 个参数（含第 7 个）原样传给原函数。
+	 * 注意：即使不拦截，也必须把 7 个参数原样传给原函数。
 	 */
 	if (protSize == 0) {
-		return old_MiReadWriteVirtualMemory(
-			ProcessHandle, BaseAddress, Buffer,
-			BufferSize, NumberOfBytesRead, Arg6, Arg7);
+		return old_MiCopyVirtualMemory(
+			SourceProcess, SourceAddress, TargetProcess,
+			TargetAddress, BufferSize, PreviousMode, ReturnSize);
 	}
 
 	protBase  = g_MiRWM_ProtectBase;
 	targetPid = (ULONG)g_MiRWM_TargetPid;
 
 	/*
-	 * 取 PreviousMode 一律用 ExGetPreviousMode()（读当前线程），
-	 * 不要用 Arg6 —— 它在不同版本上可能是 DesiredAccess。
+	 * ============================================================
+	 * 写入方向：直接拦截（必须在调用原函数之前！）
+	 * ============================================================
+	 * 拦截条件：写入方是「别人」（SourceProcess != TargetProcess），
+	 *           目标进程 == 被保护进程，且目标地址范围落在保护范围。
+	 *
+	 * 「自己写自己」（SourceProcess == TargetProcess == 被保护进程）要放行 ——
+	 * 那是被保护进程操作自己的内存，属于正常行为，拦了会破坏它自身。
+	 *
+	 * 写入一旦放行就无法收回（内存已被改写），所以这里提前返回错误、不执行拷贝。
 	 */
-	prevMode = ExGetPreviousMode();
+	if (TargetProcess != NULL && TargetAddress != NULL &&
+	    SourceProcess != TargetProcess &&                       /* 自己写自己 -> 放行 */
+	    (ULONG)(ULONG_PTR)PsGetProcessId(TargetProcess) == targetPid &&
+	    RangesOverlap((ULONG_PTR)TargetAddress, BufferSize, protBase, protSize)) {
 
-	/* ---- 引用目标进程（仅在用户态 + PASSIVE_LEVEL 下安全） ---- */
-	if (KeGetCurrentIrql() == PASSIVE_LEVEL && prevMode == UserMode) {
-		/*
-		 * DesiredAccess = 0：只要求「引用到进程对象」，不做访问权限检查。
-		 * 我们只需要拿到 EPROCESS 去取 PID，不关心调用方是否拥有
-		 * PROCESS_VM_READ —— 用 0 可以避免「句柄权限不足 -> 引用失败 ->
-		 * 漏保护」的情况。
-		 */
-		NTSTATUS refStatus = ObReferenceObjectByHandle(
-			ProcessHandle,
-			0,                      /* 不检查访问权限，只引用对象 */
-			*PsProcessType,
-			UserMode,
-			(PVOID*)&targetProcess,
-			NULL);
-		if (!NT_SUCCESS(refStatus))
-			targetProcess = NULL;
+		if (ReturnSize) {
+			__try {
+				/* ReturnSize 可能是内核指针，不能 Probe；直接写在 __try 里兜底 */
+				*ReturnSize = 0;
+			}
+			__except (EXCEPTION_EXECUTE_HANDLER) {
+				/* 忽略：ReturnSize 不可写时也不影响拦截结果 */
+			}
+		}
+
+		/* 限流日志：只打印前 MIRWM_HOOK_LOG_LIMIT 次写入拦截 */
+		{
+			ULONG hit = (ULONG)InterlockedIncrement(&g_MiRWM_WriteBlockCount);
+			if (hit <= MIRWM_HOOK_LOG_LIMIT) {
+				SimpleHvLog("[MiCopy Hook] #%u BLOCKED WRITE pid=%u dst=[0x%llx, +0x%llx) "
+				            "hits protect range [0x%llx, +0x%llx) -> write denied",
+				            hit, targetPid,
+				            (UINT64)(ULONG_PTR)TargetAddress, (UINT64)BufferSize,
+				            (UINT64)protBase, (UINT64)protSize);
+				if (hit == MIRWM_HOOK_LOG_LIMIT)
+					SimpleHvLog("[MiCopy Hook] write-block log limit reached (%u); "
+					            "further hits silent", MIRWM_HOOK_LOG_LIMIT);
+			}
+		}
+
+		return MICOPY_WRITE_BLOCK_STATUS;   /* 直接拦截，不调用原函数 */
 	}
 
-	/* ---- 先让原函数完成真正的读写（7 参数全透传！） ---- */
-	result = old_MiReadWriteVirtualMemory(
-		ProcessHandle, BaseAddress, Buffer,
-		BufferSize, NumberOfBytesRead, Arg6, Arg7);
+	/* ---- 读取方向：先让原函数完成真正的拷贝（7 参数全透传！） ---- */
+	result = old_MiCopyVirtualMemory(
+		SourceProcess, SourceAddress, TargetProcess,
+		TargetAddress, BufferSize, PreviousMode, ReturnSize);
 
-	/* 只处理成功、且目标 PID 匹配的情况 */
-	if (!targetProcess ||
+	/* 只处理成功、且参数有效的情况 */
+	if (!SourceProcess || !TargetAddress ||
 	    (result != STATUS_SUCCESS && result != STATUS_PARTIAL_COPY)) {
-		if (targetProcess)
-			ObDereferenceObject(targetProcess);
 		return result;
 	}
 
-	/* 目标进程 PID 不匹配 -> 原样返回（ULONG_PTR 中转，避免 HANDLE->ULONG 截断告警） */
-	{
-		ULONG actualPid = (ULONG)(ULONG_PTR)PsGetProcessId(targetProcess);
-		if (actualPid != targetPid) {
-			ObDereferenceObject(targetProcess);
-			return result;
-		}
-	}
+	/*
+	 * 进程身份（读取方向）：
+	 *   - 「源进程」必须是被保护进程（即有人在从被保护进程读）；
+	 *   - 且源/目标是不同进程 —— 被保护进程读自己的内存属于「自己人」，放行，
+	 *     否则会把它的目标缓冲区清零，破坏它自己的数据。
+	 * （ULONG_PTR 中转，避免 HANDLE -> ULONG 截断告警。）
+	 */
+	if ((ULONG)(ULONG_PTR)PsGetProcessId(SourceProcess) != targetPid ||
+	    SourceProcess == TargetProcess)
+		return result;
 
-	/* ---- 计算实际传输字节数 ---- */
-	bytesTransferred = 0;
-	haveByteCount = FALSE;
+	/*
+	 * ---- 计算实际拷贝字节数 ----
+	 * 关键：ReturnSize 可能是 **内核指针**！
+	 *   NtReadVirtualMemory -> MiReadWriteVirtualMemory 调 MiCopyVirtualMemory 时，
+	 *   传进来的 ReturnSize 是它自己的局部变量地址（内核栈），而此时 PreviousMode
+	 *   仍是 UserMode。若对它做 ProbeForRead，内核地址会直接抛异常，被 __except
+	 *   吞掉后误判成「拿不到字节数」而漏掉清零 —— 这正是「读不到拦截」的原因。
+	 * 因此：不做 Probe，直接在 __try 里读；读不到就退回默认值（按请求字节数算）。
+	 */
+	bytesTransferred = BufferSize;
+	haveByteCount = (result == STATUS_SUCCESS);
 
-	if (NumberOfBytesRead) {
+	if (ReturnSize) {
 		__try {
-			ProbeForRead(NumberOfBytesRead, sizeof(SIZE_T), __alignof(SIZE_T));
-			bytesTransferred = *NumberOfBytesRead;
-			haveByteCount = (bytesTransferred <= BufferSize);
+			SIZE_T n = *ReturnSize;
+			if (n <= BufferSize) {
+				bytesTransferred = n;
+				haveByteCount = TRUE;
+			}
 		}
 		__except (EXCEPTION_EXECUTE_HANDLER) {
-			haveByteCount = FALSE;
+			/* 读不到就沿用上面的默认值 */
 		}
-	} else if (result == STATUS_SUCCESS) {
-		bytesTransferred = BufferSize;
-		haveByteCount = TRUE;
 	}
 
-	/* ---- 只清零「读取范围 ∩ 保护范围」那一段 ---- */
-	if (haveByteCount && bytesTransferred != 0 && Buffer) {
-		ULONG_PTR readStart = (ULONG_PTR)BaseAddress;
+	/* ---- 计算交集并清零；无论是否命中都打一条限流诊断日志 ---- */
+	/*
+	 * 走到这里说明：有人在从「被保护进程」读。
+	 * 诊断价值：如果连 "READ ... reached hook" 都看不到，就说明该读取路径
+	 *           根本没有经过 MiCopyVirtualMemory（而不是我们的条件写错了）。
+	 *
+	 * 目标缓冲区必须位于**当前地址空间**才敢直接写（TargetAddress 是 TargetProcess
+	 * 里的地址）。典型读取场景 TargetProcess == 调用方 == 当前进程，成立。
+	 */
+	{
+		ULONG_PTR readStart  = (ULONG_PTR)SourceAddress;
+		ULONG_PTR zeroOffset = 0;
+		ULONG_PTR zeroSize   = 0;
+		BOOLEAN   dstInCur   = (TargetProcess == PsGetCurrentProcess());
 
-		/* 溢出保护 */
-		if (bytesTransferred <= MAXULONG_PTR - readStart &&
+		if (haveByteCount && bytesTransferred != 0 && dstInCur &&
+		    bytesTransferred <= MAXULONG_PTR - readStart &&
 		    protSize        <= MAXULONG_PTR - protBase) {
 
 			ULONG_PTR readEnd    = readStart + bytesTransferred;
@@ -1070,41 +1221,49 @@ NTSTATUS NTAPI FakeMiReadWriteVirtualMemory(
 			ULONG_PTR isectEnd   = (readEnd   < protEnd)   ? readEnd   : protEnd;
 
 			if (isectStart < isectEnd) {
-				ULONG_PTR offset = isectStart - readStart;  /* 在调用方 buffer 中的偏移 */
-				ULONG_PTR size   = isectEnd - isectStart;   /* 需要清零的字节数 */
+				zeroOffset = isectStart - readStart;  /* 在目标缓冲区中的偏移 */
+				zeroSize   = isectEnd - isectStart;   /* 需要清零的字节数 */
 
-				if (size <= MAXULONG_PTR - (ULONG_PTR)Buffer) {
-					PVOID dest = (PVOID)((ULONG_PTR)Buffer + offset);
+				if (zeroSize <= MAXULONG_PTR - (ULONG_PTR)TargetAddress) {
+					PVOID dest = (PVOID)((ULONG_PTR)TargetAddress + zeroOffset);
 
 					__try {
-						if (prevMode == UserMode)
-							ProbeForWrite(dest, (SIZE_T)size, 1);
-						RtlZeroMemory(dest, (SIZE_T)size);
+						/* 直接写：地址已被原函数验证过，__try 兜底异常即可 */
+						RtlZeroMemory(dest, (SIZE_T)zeroSize);
 					}
 					__except (EXCEPTION_EXECUTE_HANDLER) {
-						SimpleHvLogError("[MiRWM Hook] clear buffer failed: 0x%x",
+						SimpleHvLogError("[MiCopy Hook] clear buffer failed: 0x%x",
 						                 GetExceptionCode());
+						zeroSize = 0;
 					}
-
-					/* 限流日志：只打印前 MIRWM_HOOK_LOG_LIMIT 次命中 */
-					{
-						ULONG hit = (ULONG)InterlockedIncrement(&g_MiRWM_HookHitCount);
-						if (hit <= MIRWM_HOOK_LOG_LIMIT) {
-							SimpleHvLog("[MiRWM Hook] #%u pid=%u read [0x%llx, +0x%llx) "
-							            "hits protect range -> zeroed 0x%llx bytes (buf+0x%llx)",
-							            hit, targetPid,
-							            (UINT64)readStart, (UINT64)bytesTransferred,
-							            (UINT64)size, (UINT64)offset);
-							if (hit == MIRWM_HOOK_LOG_LIMIT)
-								SimpleHvLog("[MiRWM Hook] log limit reached (%u); "
-								            "further hits silent", MIRWM_HOOK_LOG_LIMIT);
-						}
-					}
+				} else {
+					zeroSize = 0;
 				}
+			}
+		}
+
+		/* 限流日志：只打印前 MIRWM_HOOK_LOG_LIMIT 次 */
+		{
+			ULONG hit = (ULONG)InterlockedIncrement(&g_MiRWM_HookHitCount);
+			if (hit <= MIRWM_HOOK_LOG_LIMIT) {
+				if (zeroSize) {
+					SimpleHvLog("[MiCopy Hook] #%u pid=%u READ [0x%llx, +0x%llx) hits "
+					            "protect range -> zeroed 0x%llx bytes (buf+0x%llx)",
+					            hit, targetPid, (UINT64)readStart, (UINT64)bytesTransferred,
+					            (UINT64)zeroSize, (UINT64)zeroOffset);
+				} else {
+					SimpleHvLog("[MiCopy Hook] #%u pid=%u READ [0x%llx, +0x%llx) reached hook "
+					            "but NOT zeroed (prot=[0x%llx, +0x%llx) haveBytes=%u dstInCurProc=%u)",
+					            hit, targetPid, (UINT64)readStart, (UINT64)bytesTransferred,
+					            (UINT64)protBase, (UINT64)protSize,
+					            (ULONG)haveByteCount, (ULONG)dstInCur);
+				}
+				if (hit == MIRWM_HOOK_LOG_LIMIT)
+					SimpleHvLog("[MiCopy Hook] log limit reached (%u); further hits silent",
+					            MIRWM_HOOK_LOG_LIMIT);
 			}
 		}
 	}
 
-	ObDereferenceObject(targetProcess);
 	return result;
 }

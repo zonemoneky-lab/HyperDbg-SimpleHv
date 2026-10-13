@@ -28,6 +28,9 @@
 #define IOCTL_SIMPLEHV_SET_MIRWM_RANGE \
     CTL_CODE(FILE_DEVICE_SIMPLEHV, 0x803, METHOD_BUFFERED, FILE_ANY_ACCESS)
 
+#define IOCTL_SIMPLEHV_SET_MMCOPY_REGION \
+    CTL_CODE(FILE_DEVICE_SIMPLEHV, 0x804, METHOD_BUFFERED, FILE_ANY_ACCESS)
+
 //////////////////////////////////////////////////
 //            Data Structures                   //
 //////////////////////////////////////////////////
@@ -57,6 +60,21 @@ typedef struct _SIMPLEHV_SET_MIRWM_RANGE_RESPONSE {
     UINT64 BaseAddress;     // 实际生效的基址
     UINT64 Size;            // 实际生效的大小
 } SIMPLEHV_SET_MIRWM_RANGE_RESPONSE, *PSIMPLEHV_SET_MIRWM_RANGE_RESPONSE;
+
+// 设置 MmCopyMemory 隐藏区域（必须与驱动端 DeviceIoctl.h 布局一致）
+typedef struct _SIMPLEHV_SET_MMCOPY_REGION_REQUEST {
+    UINT32 ProcessId;       // 可选，限定进程；0 = 任意进程
+    UINT32 Reserved;        // 对齐填充
+    UINT64 Start;           // 隐藏区域起始地址
+    UINT64 Size;            // 隐藏区域大小（0 = 关闭拦截）
+} SIMPLEHV_SET_MMCOPY_REGION_REQUEST, *PSIMPLEHV_SET_MMCOPY_REGION_REQUEST;
+
+typedef struct _SIMPLEHV_SET_MMCOPY_REGION_RESPONSE {
+    UINT32 Status;          // NTSTATUS
+    UINT32 ProcessId;       // 实际生效的 PID
+    UINT64 Start;           // 实际生效的起始地址
+    UINT64 Size;            // 实际生效的大小
+} SIMPLEHV_SET_MMCOPY_REGION_RESPONSE, *PSIMPLEHV_SET_MMCOPY_REGION_RESPONSE;
 
 //////////////////////////////////////////////////
 //            SimpleHv Client Class             //
@@ -174,6 +192,34 @@ public:
             sizeof(SIMPLEHV_SET_MIRWM_RANGE_REQUEST),
             response,
             sizeof(SIMPLEHV_SET_MIRWM_RANGE_RESPONSE),
+            &bytesReturned,
+            NULL
+        ) != FALSE;
+    }
+
+    /**
+     * @brief Set MmCopyMemory hide region (optional PID + address range)
+     * @details 源地址范围与 [Start, Start + Size) 重叠的拷贝会被拦截。
+     *          ProcessId == 0 表示不限进程；Size == 0 表示关闭拦截。
+     */
+    bool SetMmCopyRegion(UINT32 processId, UINT64 start, UINT64 size,
+                         SIMPLEHV_SET_MMCOPY_REGION_RESPONSE* response) {
+        if (!IsConnected()) return false;
+
+        SIMPLEHV_SET_MMCOPY_REGION_REQUEST request = { 0 };
+        request.ProcessId = processId;
+        request.Reserved  = 0;
+        request.Start     = start;
+        request.Size      = size;
+
+        DWORD bytesReturned;
+        return DeviceIoControl(
+            hDevice,
+            IOCTL_SIMPLEHV_SET_MMCOPY_REGION,
+            &request,
+            sizeof(SIMPLEHV_SET_MMCOPY_REGION_REQUEST),
+            response,
+            sizeof(SIMPLEHV_SET_MMCOPY_REGION_RESPONSE),
             &bytesReturned,
             NULL
         ) != FALSE;
