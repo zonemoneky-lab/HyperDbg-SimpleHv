@@ -3,11 +3,13 @@
  * @brief EPT Hook 测试示例 - 使用 EptHookInstallHiddenInlineHookAuto
  * @details
  *     演示如何使用 EptHookInstallHiddenInlineHookAuto 实现内核函数 Hook
- *     Hook 四个关键函数实现进程保护：
+ *     Hook 五个关键函数实现进程保护：
  *     1. ObpReferenceObjectByHandleWithTag - 防止进程被打开
  *     2. NtQuerySystemInformation - 隐藏进程
  *     3. MiCopyVirtualMemory - 拦截跨进程内存读写（从 MmCopyVirtualMemory 反汇编定位）
  *     4. MmCopyMemory - 拦截直接内存拷贝（导出函数，隐藏区域命中即阻断）
+ *     5. MmQueryVirtualMemory - 查询受保护模块区域时把 Protect 伪装成 PAGE_NOACCESS
+ *        （未导出，特征码扫描定位）
  */
 
 #include "pch.h"
@@ -98,6 +100,39 @@ typedef NTSTATUS(NTAPI* pMmCopyMemory)(
 	PSIZE_T NumberOfBytesTransferred
 );
 
+/*
+ * MmQueryVirtualMemory function type.
+ *
+ * 这是 NtQueryVirtualMemory 的底层实现（**未导出**）。NtQueryVirtualMemory 只是
+ * 一个很薄的包装（用户给出的反编译）：
+ *
+ *     NtQueryVirtualMemory(Handle, Base, Class, Info, InfoLen, RetLen)
+ *         -> MmQueryVirtualMemory(Handle, Base, Class, Info, InfoLen, RetLen, 2)
+ *
+ * 第 7 个参数在反编译里直接写成常量 2，含义不明；这里原样透传，不做解释。
+ *
+ * 原型：
+ *   NTSTATUS MmQueryVirtualMemory(
+ *       HANDLE                    ProcessHandle,
+ *       PVOID                     BaseAddress,
+ *       MEMORY_INFORMATION_CLASS  MemoryInformationClass,
+ *       PVOID                     MemoryInformation,
+ *       SIZE_T                    MemoryInformationLength,
+ *       PSIZE_T                   ReturnLength,
+ *       ULONG                     Unknown);          // 调用方传 2
+ *
+ * 未导出 => 只能靠特征码扫描定位，见 ResolveMmQueryVirtualMemory()。
+ */
+typedef NTSTATUS(NTAPI* pMmQueryVirtualMemory)(
+	HANDLE                    ProcessHandle,
+	PVOID                     BaseAddress,
+	MEMORY_INFORMATION_CLASS  MemoryInformationClass,
+	PVOID                     MemoryInformation,
+	SIZE_T                    MemoryInformationLength,
+	PSIZE_T                   ReturnLength,
+	ULONG                     Unknown
+);
+
 // ========================================
 // 全局变量 - 保存原始函数地址
 // ========================================
@@ -106,10 +141,12 @@ fnObReferenceObjectByHandleWithTag old_ObpReferenceObjectByHandleWithTag = NULL;
 fnNtQuerySystemInformation old_NtQuerySystemInformation = NULL;
 pMiCopyVirtualMemory old_MiCopyVirtualMemory = NULL;
 pMmCopyMemory old_MmCopyMemory = NULL;
+pMmQueryVirtualMemory old_MmQueryVirtualMemory = NULL;
 static BOOLEAN g_ObpTestHookInstalled = FALSE;
 static BOOLEAN g_NtQueryTestHookInstalled = FALSE;
 static BOOLEAN g_MiRWM_TestHookInstalled = FALSE;
 static BOOLEAN g_MmCopyTestHookInstalled = FALSE;
+static BOOLEAN g_MmQuery_TestHookInstalled = FALSE;
 
 /*
  * MiCopy 运行期日志限流：
@@ -167,6 +204,17 @@ static volatile ULONG_PTR g_HideMemTargetPid   = 0;
 static volatile LONG g_MmCopy_HookHitCount = 0;    /* 命中拦截次数 */
 static volatile LONG g_MmCopy_PhysMissCount = 0;   /* 物理地址无法映射成 VA 的次数 */
 
+/*
+ * MmQueryVirtualMemory 运行期日志限流：查询命中受保护区域、把 Protect 改写成
+ * PAGE_NOACCESS 的前 MMQUERY_HOOK_LOG_LIMIT 次会打日志，之后静默（改写照旧）。
+ *
+ * 注意：该 Hook 复用 MiCopyVirtualMemory 的同一份保护范围配置
+ * （g_MiRWM_TargetPid / g_MiRWM_ProtectBase / g_MiRWM_ProtectSize）——
+ * 「要保护的模块地址区域」就是这一份，无需单独配置。
+ */
+#define MMQUERY_HOOK_LOG_LIMIT 8
+static volatile LONG g_MmQuery_HookHitCount = 0;   /* Protect 改写命中次数 */
+
 /**
  * @brief 判断「读取区间 [addr, addr+len)」是否与「目标区间 [region, region+size)」重叠
  * @details 处理了整数溢出：若加法溢出则视为「可能重叠」，返回 TRUE（保守拦截）。
@@ -223,14 +271,17 @@ VOID ResetTestHooksState(VOID)
 	g_NtQueryTestHookInstalled = FALSE;
 	g_MiRWM_TestHookInstalled = FALSE;
 	g_MmCopyTestHookInstalled = FALSE;
+	g_MmQuery_TestHookInstalled = FALSE;
 	g_MiRWM_HookHitCount = 0;
 	g_MiRWM_WriteBlockCount = 0;
 	g_MmCopy_HookHitCount = 0;
 	g_MmCopy_PhysMissCount = 0;
+	g_MmQuery_HookHitCount = 0;
 	old_ObpReferenceObjectByHandleWithTag = NULL;
 	old_NtQuerySystemInformation = NULL;
 	old_MiCopyVirtualMemory = NULL;
 	old_MmCopyMemory = NULL;
+	old_MmQueryVirtualMemory = NULL;
 	SimpleHvLog("[Test] Test-hook state reset after UNHOOK_ALL");
 }
 
@@ -616,6 +667,12 @@ NTSTATUS NTAPI FakeMiCopyVirtualMemory(
 	PEPROCESS SourceProcess, PVOID SourceAddress, PEPROCESS TargetProcess,
 	PVOID TargetAddress, SIZE_T BufferSize,
 	KPROCESSOR_MODE PreviousMode, PSIZE_T ReturnSize);
+PVOID    ResolveMmQueryVirtualMemory(VOID);
+NTSTATUS NTAPI MmQueryVirtualMemoryHook(
+	HANDLE ProcessHandle, PVOID BaseAddress,
+	MEMORY_INFORMATION_CLASS MemoryInformationClass,
+	PVOID MemoryInformation, SIZE_T MemoryInformationLength,
+	PSIZE_T ReturnLength, ULONG Unknown);
 
 /**
  * @brief 安装所有测试 Hooks
@@ -624,6 +681,8 @@ NTSTATUS NTAPI FakeMiCopyVirtualMemory(
  *          2. NtQuerySystemInformation - 隐藏指定进程
  *          3. MiCopyVirtualMemory - 拦截跨进程内存读写（从 MmCopyVirtualMemory 反汇编定位）
  *          4. MmCopyMemory - 拦截直接内存拷贝（导出函数，隐藏区域命中即阻断）
+ *          5. MmQueryVirtualMemory - 查询受保护模块区域时把 Protect 伪装成 PAGE_NOACCESS
+ *             （未导出，特征码扫描定位）
  * @return NTSTATUS 成功返回 STATUS_SUCCESS，失败返回相应错误码
  * @note 必须在 VMX non-root mode 下调用（从安装测试 Hook 的 IOCTL 调用）
  */
@@ -633,6 +692,7 @@ NTSTATUS InstallTestHooks(VOID)
 	PVOID pNtQuerySystemInformation;
 	PVOID pMiCopy = NULL;
 	PVOID pMmCopyMemory = NULL;
+	PVOID pMmQuery = NULL;
 	BOOLEAN result;
 	UINT32 coreId;
 	UINT32 processId;
@@ -832,14 +892,14 @@ NTSTATUS InstallTestHooks(VOID)
 	 */
 	if (g_MmCopyTestHookInstalled) {
 		SimpleHvLog("[Test] Hook 4 already installed; trampoline=%p", old_MmCopyMemory);
-		goto hooks_installed;
+		goto install_hook_5;
 	}
 
 	RtlInitUnicodeString(&routineName, L"MmCopyMemory");
 	pMmCopyMemory = MmGetSystemRoutineAddress(&routineName);
 	if (!pMmCopyMemory) {
 		SimpleHvLogError("[Test] Failed to find MmCopyMemory (exported)");
-		goto hooks_installed;
+		goto install_hook_5;
 	}
 
 	SimpleHvLog("[Test] MmCopyMemory: 0x%llx", pMmCopyMemory);
@@ -878,6 +938,66 @@ NTSTATUS InstallTestHooks(VOID)
 		SimpleHvLogWarning("[Test] Hook 4 (MmCopyMemory) NOT installed; other hooks remain active");
 	}
 
+	install_hook_5:
+	// ========================================
+	// 3d. Hook MmQueryVirtualMemory (not exported -> signature scan)
+	// ========================================
+	/*
+	 * MmQueryVirtualMemory 是 NtQueryVirtualMemory 的底层实现，未导出，只能
+	 * 特征码扫描定位。Hook 它可以在「查询受保护模块区域」时把返回的
+	 * MEMORY_BASIC_INFORMATION.Protect 伪装成 PAGE_NOACCESS，让扫描/转储工具
+	 * 以为该区域不可访问（配合 Hook 3 的读写拦截）。
+	 *
+	 * 扫描范围的坑：SystemModuleInformation 报的 ImageSize 偏小，必须解析 PE
+	 * 头用真实 SizeOfImage —— 见 ResolveMmQueryVirtualMemory()。
+	 */
+	if (g_MmQuery_TestHookInstalled) {
+		SimpleHvLog("[Test] Hook 5 already installed; trampoline=%p", old_MmQueryVirtualMemory);
+		goto hooks_installed;
+	}
+
+	pMmQuery = ResolveMmQueryVirtualMemory();
+	if (!pMmQuery) {
+		SimpleHvLogError("[Test] Failed to resolve MmQueryVirtualMemory by signature scan");
+		/* Non-fatal: the other hooks are still useful */
+		goto hooks_installed;
+	}
+
+	coreId = KeGetCurrentProcessorNumberEx(NULL);
+	processId = HANDLE_TO_UINT32(PsGetCurrentProcessId());
+	SimpleHvLog("[Test] Hook 5 request: core=%u pid=%u IRQL=%u target=%p handler=%p pageOffset=0x%Ix",
+	            coreId, processId, KeGetCurrentIrql(), pMmQuery,
+	            MmQueryVirtualMemoryHook,
+	            (SIZE_T)pMmQuery & (PAGE_SIZE - 1));
+
+	result = ConfigureEptHook2(coreId,
+	                           pMmQuery,
+	                           (PVOID)MmQueryVirtualMemoryHook,
+	                           processId,
+	                           (PVOID *)&old_MmQueryVirtualMemory);
+	if (result) {
+		SimpleHvLog("[Test] Hook 5 installed: MmQueryVirtualMemory");
+		SimpleHvLog("[Test]   target     = 0x%llx", (UINT64)pMmQuery);
+		SimpleHvLog("[Test]   trampoline = 0x%llx", (UINT64)old_MmQueryVirtualMemory);
+
+		if (old_MmQueryVirtualMemory == NULL) {
+			SimpleHvLogError("[Test] ERROR: Hook 5 Trampoline is NULL!");
+			return STATUS_UNSUCCESSFUL;
+		}
+
+		if ((UINT64)old_MmQueryVirtualMemory < 0xFFFF000000000000) {
+			SimpleHvLogError("[Test] ERROR: Hook 5 Trampoline address looks invalid: 0x%llx",
+				old_MmQueryVirtualMemory);
+			return STATUS_UNSUCCESSFUL;
+		}
+		g_MmQuery_TestHookInstalled = TRUE;
+	} else {
+		SimpleHvLogError("[Test] Failed to install Hook 5: core=%u pid=%u target=%p handler=%p trampoline=%p",
+		                 coreId, processId, pMmQuery,
+		                 MmQueryVirtualMemoryHook, old_MmQueryVirtualMemory);
+		SimpleHvLogWarning("[Test] Hook 5 (MmQueryVirtualMemory) NOT installed; other hooks remain active");
+	}
+
 	hooks_installed:
 	// ========================================
 	// 4. 完成
@@ -892,6 +1012,8 @@ NTSTATUS InstallTestHooks(VOID)
 	            g_MiRWM_TestHookInstalled ? "OK" : "--");
 	SimpleHvLog("[Test]   [%s] 4. MmCopyMemory",
 	            g_MmCopyTestHookInstalled ? "OK" : "--");
+	SimpleHvLog("[Test]   [%s] 5. MmQueryVirtualMemory",
+	            g_MmQuery_TestHookInstalled ? "OK" : "--");
 	SimpleHvLog("[Test] Protected processes:");
 	for (i = 0; i < sizeof(protected_process_list) / sizeof(PCWCH); i++) {
 		SimpleHvLog("[Test]   - %ws", protected_process_list[i]);
@@ -900,6 +1022,8 @@ NTSTATUS InstallTestHooks(VOID)
 	            MIRWM_HOOK_LOG_LIMIT);
 	SimpleHvLog("[Test] MmCopy runtime hit logs throttled to first %u hits",
 	            MMCOPY_HOOK_LOG_LIMIT);
+	SimpleHvLog("[Test] MmQuery runtime hit logs throttled to first %u hits",
+	            MMQUERY_HOOK_LOG_LIMIT);
 	SimpleHvLog("========================================");
 
 	return STATUS_SUCCESS;
@@ -1026,6 +1150,309 @@ PVOID ResolveMiCopyVirtualMemory(VOID)
 	SimpleHvLog("[MiCopy]   offset from MmCopyVirtualMemory  = +0x%llx",
 	            (UINT64)((PUCHAR)pMiCopyVirtualMemory - (PUCHAR)pMmCopyVirtualMemory));
 	return pMiCopyVirtualMemory;
+}
+
+// ========================================
+// Resolving MmQueryVirtualMemory (by signature scan)
+// ========================================
+
+/*
+ * MmQueryVirtualMemory 未导出，只能特征码定位。用户在自己内核的 IDA 里为
+ * 0x1409D9280（= RVA 0x9D9280，PAGE 段）生成的 45 字节特征串：
+ *
+ *   4C 8B DC 53 56 57 41 54 41 55 41 56 41 57 48 81 EC ?? ?? ?? ??
+ *   48 8B 05 ?? ?? ?? ?? 48 33 C4 48 89 84 24 ?? ?? ?? ??
+ *   49 8B F1 4D 63 E8
+ *
+ * 即函数序言：mov r11,rsp; push rbx/rsi/rdi/r12/r13/r14/r15; sub rsp,imm32;
+ * mov rax,[rip+?]; xor rax,rsp; mov [rsp+?],rax; mov rsi,r9; movsxd r13,r8d
+ *
+ * 注意：早期给的一条 47 字节特征串（尾部是 4C 89 4C 24 ?? 4D 63 F0）在本机
+ * 内核里 0 匹配 —— 那是别的版本/别处生成的，尾部指令序列不同。特征串必须用
+ * 「目标内核自己」生成，换内核版本后要重新生成。
+ *
+ * ⚠ 扫描范围的坑（用户强调）：SystemModuleInformation 里报的 ImageSize 在部分
+ *   版本上明显偏小（实测约 3.5MB），如果只按它扫，**永远扫不到**。必须解析内核
+ *   镜像的 PE 头，用 PE 里真实的 SizeOfImage 作为扫描范围。
+ */
+
+/* --- SystemModuleInformation 结构（WDK 内核头未提供，按公开定义自己写） --- */
+typedef struct _MMQUERY_RTL_PROCESS_MODULE_INFORMATION {
+	HANDLE Section;
+	PVOID  MappedBase;
+	PVOID  ImageBase;
+	ULONG  ImageSize;
+	ULONG  Flags;
+	USHORT LoadOrderIndex;
+	USHORT InitOrderIndex;
+	USHORT LoadCount;
+	USHORT OffsetToFileName;
+	UCHAR  FullPathName[256];
+} MMQUERY_RTL_PROCESS_MODULE_INFORMATION, *PMMQUERY_RTL_PROCESS_MODULE_INFORMATION;
+
+typedef struct _MMQUERY_RTL_PROCESS_MODULES {
+	ULONG NumberOfModules;
+	MMQUERY_RTL_PROCESS_MODULE_INFORMATION Modules[1];
+} MMQUERY_RTL_PROCESS_MODULES, *PMMQUERY_RTL_PROCESS_MODULES;
+
+/* ZwQuerySystemInformation 原型（内核头未声明，用 MmGetSystemRoutineAddress 解析） */
+typedef NTSTATUS(NTAPI* pZwQuerySystemInformation)(
+	SYSTEM_INFORMATION_CLASS SystemInformationClass,
+	PVOID                    SystemInformation,
+	ULONG                    SystemInformationLength,
+	PULONG                   ReturnLength);
+
+/* 特征码：45 字节，12 个通配符 */
+#define MMQUERY_SIGNATURE_LEN 45
+static const UCHAR g_MmQuery_Signature[MMQUERY_SIGNATURE_LEN] = {
+	0x4C, 0x8B, 0xDC, 0x53, 0x56, 0x57, 0x41, 0x54, 0x41, 0x55,
+	0x41, 0x56, 0x41, 0x57, 0x48, 0x81, 0xEC, 0x00, 0x00, 0x00,
+	0x00, 0x48, 0x8B, 0x05, 0x00, 0x00, 0x00, 0x00, 0x48, 0x33,
+	0xC4, 0x48, 0x89, 0x84, 0x24, 0x00, 0x00, 0x00, 0x00, 0x49,
+	0x8B, 0xF1, 0x4D, 0x63, 0xE8
+};
+/* mask[i] == 0 表示该字节是通配符（不比较） */
+static const UCHAR g_MmQuery_Mask[MMQUERY_SIGNATURE_LEN] = {
+	1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+	1, 1, 1, 1, 1, 1, 1, 0, 0, 0,
+	0, 1, 1, 1, 0, 0, 0, 0, 1, 1,
+	1, 1, 1, 1, 1, 0, 0, 0, 0, 1,
+	1, 1, 1, 1, 1
+};
+
+/* 判断 p 处是否匹配特征码（只比较 mask 为 1 的字节） */
+static BOOLEAN MmQuery_MatchAt(const UCHAR* p)
+{
+	SIZE_T i;
+	for (i = 0; i < MMQUERY_SIGNATURE_LEN; i++) {
+		if (g_MmQuery_Mask[i] && p[i] != g_MmQuery_Signature[i])
+			return FALSE;
+	}
+	return TRUE;
+}
+
+/**
+ * @brief 在 [start, start+len) 内按页扫描特征码
+ * @details 逐页扫描并各自用 __try 兜底：即使某个页不可读（例如回退范围超出
+ *          镜像末尾），也只跳过那一页，不会让整个扫描失败。
+ */
+static PVOID MmQuery_ScanSignature(PVOID start, SIZE_T len)
+{
+	PUCHAR base = (PUCHAR)start;
+	SIZE_T off;
+
+	if (start == NULL || len < MMQUERY_SIGNATURE_LEN)
+		return NULL;
+
+	for (off = 0; off + MMQUERY_SIGNATURE_LEN <= len; ) {
+		ULONG_PTR addr  = (ULONG_PTR)(base + off);
+		SIZE_T    chunk = PAGE_SIZE - (SIZE_T)(addr & (PAGE_SIZE - 1));
+		SIZE_T    end   = off + chunk;                 /* 本页内「起点」上界（不含） */
+		PVOID     hit   = NULL;
+
+		/* 起点最多到 len - 47，保证整串都在范围内 */
+		if (end > len - MMQUERY_SIGNATURE_LEN + 1)
+			end = len - MMQUERY_SIGNATURE_LEN + 1;
+
+		__try {
+			SIZE_T i;
+			for (i = off; i < end; i++) {
+				if (base[i] != g_MmQuery_Signature[0])   /* 首字节快速过滤 */
+					continue;
+				if (MmQuery_MatchAt(base + i)) {
+					hit = (PVOID)(base + i);
+					break;
+				}
+			}
+		}
+		__except (EXCEPTION_EXECUTE_HANDLER) {
+			SimpleHvLogWarning("[MmQuery] unreadable page at 0x%llx during scan; skipping",
+			                   (UINT64)addr);
+			hit = NULL;
+		}
+
+		if (hit)
+			return hit;
+
+		off += chunk;
+	}
+
+	return NULL;
+}
+
+/**
+ * @brief 解析内核镜像 PE 头，返回真实的 SizeOfImage，并打印各 section
+ * @details 全部用裸偏移解析，避免引入 ntimage.h 依赖：
+ *            e_lfanew @ DOS+0x3C；NT 签名 @ NT+0x00；
+ *            NumberOfSections @ NT+0x06；SizeOfOptionalHeader @ NT+0x14；
+ *            SizeOfImage @ NT+0x50（= OptionalHeader+0x38）；
+ *            section 头 @ NT+0x18+SizeOfOptionalHeader，每条 40 字节：
+ *              VirtualSize @ +0x08，VirtualAddress @ +0x0C。
+ * @return PE SizeOfImage；解析失败返回 0
+ */
+static ULONG MmQuery_GetImageSize(PVOID imageBase)
+{
+	PUCHAR base = (PUCHAR)imageBase;
+	ULONG  e_lfanew;
+	ULONG  sizeOfImage = 0;
+	USHORT numSections;
+	USHORT sizeOfOptHdr;
+	PUCHAR pSection;
+	SIZE_T i;
+
+	if (imageBase == NULL)
+		return 0;
+
+	__try {
+		e_lfanew = *(ULONG*)(base + 0x3C);
+
+		/* NT 签名 "PE\0\0" */
+		if (*(ULONG*)(base + e_lfanew) != 0x00004550) {
+			SimpleHvLogError("[MmQuery] invalid PE signature at 0x%llx",
+			                 (UINT64)(ULONG_PTR)(base + e_lfanew));
+			return 0;
+		}
+
+		numSections  = *(USHORT*)(base + e_lfanew + 0x06);
+		sizeOfOptHdr = *(USHORT*)(base + e_lfanew + 0x14);
+		sizeOfImage  = *(ULONG*)(base + e_lfanew + 0x50);
+
+		SimpleHvLog("[MmQuery] PE: e_lfanew=0x%x numSections=%u optHdrSize=0x%x SizeOfImage=0x%x",
+		            e_lfanew, numSections, sizeOfOptHdr, sizeOfImage);
+
+		pSection = base + e_lfanew + 0x18 + sizeOfOptHdr;
+		for (i = 0; i < numSections && i < 32; i++) {
+			PUCHAR sec  = pSection + i * 40;
+			char   name[9];
+			ULONG  vSize = *(ULONG*)(sec + 0x08);
+			ULONG  vAddr = *(ULONG*)(sec + 0x0C);
+
+			RtlCopyMemory(name, sec, 8);
+			name[8] = '\0';
+			SimpleHvLog("[MmQuery]   section[%u] '%s' VA=0x%x VSize=0x%x",
+			            (UINT)i, name, vAddr, vSize);
+		}
+	}
+	__except (EXCEPTION_EXECUTE_HANDLER) {
+		SimpleHvLogError("[MmQuery] PE parse faulted at 0x%llx", (UINT64)(ULONG_PTR)imageBase);
+		return 0;
+	}
+
+	return sizeOfImage;
+}
+
+/**
+ * @brief 取内核模块信息，返回 ntoskrnl 加载基址
+ * @details 必须用 ZwQuerySystemInformation（内核态入口，强制 PreviousMode=KernelMode）。
+ *          若用 Nt*，在 IOCTL 线程里 PreviousMode 仍是 UserMode，会对我们的内核
+ *          缓冲区做 Probe 而失败。
+ * @param outReportedSize 可选，回传模块信息里报的 ImageSize（仅供对比诊断）
+ * @return 内核基址；失败返回 NULL
+ */
+static PVOID MmQuery_GetKernelBase(ULONG* outReportedSize)
+{
+	UNICODE_STRING            routineName = RTL_CONSTANT_STRING(L"ZwQuerySystemInformation");
+	pZwQuerySystemInformation zwQuery;
+	PMMQUERY_RTL_PROCESS_MODULES modules;
+	ULONG                     bufSize = 0x10000;   /* 64KB，通常足够 */
+	ULONG                     retLen  = 0;
+	NTSTATUS                  status;
+	PVOID                     base = NULL;
+
+	if (outReportedSize)
+		*outReportedSize = 0;
+
+	zwQuery = (pZwQuerySystemInformation)MmGetSystemRoutineAddress(&routineName);
+	if (!zwQuery) {
+		SimpleHvLogError("[MmQuery] ZwQuerySystemInformation not found");
+		return NULL;
+	}
+
+	modules = (PMMQUERY_RTL_PROCESS_MODULES)PlatformMemAllocateZeroedNonPagedPool(bufSize);
+	if (!modules) {
+		SimpleHvLogError("[MmQuery] failed to allocate %u bytes for module info", bufSize);
+		return NULL;
+	}
+
+	status = zwQuery(SystemModuleInformation, modules, bufSize, &retLen);
+	if (status == STATUS_INFO_LENGTH_MISMATCH) {
+		PlatformMemFreePool(modules);
+		bufSize = retLen + 0x1000;
+		modules = (PMMQUERY_RTL_PROCESS_MODULES)PlatformMemAllocateZeroedNonPagedPool(bufSize);
+		if (!modules) {
+			SimpleHvLogError("[MmQuery] failed to allocate %u bytes for module info", bufSize);
+			return NULL;
+		}
+		status = zwQuery(SystemModuleInformation, modules, bufSize, &retLen);
+	}
+
+	if (!NT_SUCCESS(status)) {
+		SimpleHvLogError("[MmQuery] ZwQuerySystemInformation(SystemModuleInformation) failed: 0x%x",
+		                 status);
+		PlatformMemFreePool(modules);
+		return NULL;
+	}
+
+	if (modules->NumberOfModules == 0) {
+		SimpleHvLogError("[MmQuery] module list is empty");
+		PlatformMemFreePool(modules);
+		return NULL;
+	}
+
+	base = modules->Modules[0].ImageBase;
+	if (outReportedSize)
+		*outReportedSize = modules->Modules[0].ImageSize;
+
+	SimpleHvLog("[MmQuery] kernel module[0]: base=0x%llx reportedImageSize=0x%x (%u modules)",
+	            (UINT64)(ULONG_PTR)base, modules->Modules[0].ImageSize, modules->NumberOfModules);
+
+	PlatformMemFreePool(modules);
+	return base;
+}
+
+/**
+ * @brief 解析 MmQueryVirtualMemory 地址（特征码扫描）
+ * @return MmQueryVirtualMemory 地址；失败返回 NULL
+ */
+PVOID ResolveMmQueryVirtualMemory(VOID)
+{
+	PVOID kernelBase;
+	ULONG reportedSize = 0;
+	ULONG imageSize;
+	PVOID found;
+
+	SimpleHvLog("[MmQuery] ===== Resolving MmQueryVirtualMemory (signature scan) =====");
+
+	kernelBase = MmQuery_GetKernelBase(&reportedSize);
+	if (!kernelBase) {
+		SimpleHvLogError("[MmQuery] FAILED: cannot get kernel base");
+		return NULL;
+	}
+
+	imageSize = MmQuery_GetImageSize(kernelBase);
+	if (imageSize == 0) {
+		/* PE 解析失败：退回一个足够大的固定范围（逐页 __try 兜底不可读页） */
+		imageSize = 0x2000000;   /* 32MB */
+		SimpleHvLogWarning("[MmQuery] PE SizeOfImage unavailable; fallback scan range 0x%x",
+		                   imageSize);
+	}
+
+	SimpleHvLog("[MmQuery] scan range: [0x%llx, +0x%x)  (module-info reported ImageSize=0x%x)",
+	            (UINT64)(ULONG_PTR)kernelBase, imageSize, reportedSize);
+
+	found = MmQuery_ScanSignature(kernelBase, imageSize);
+	if (!found) {
+		SimpleHvLogError("[MmQuery] FAILED: signature not found in [0x%llx, +0x%x)",
+		                 (UINT64)(ULONG_PTR)kernelBase, imageSize);
+		SimpleHvLogError("[MmQuery] hint: the signature may not match this kernel build; "
+		                 "regenerate it from THIS kernel's IDA (see g_MmQuery_Signature)");
+		return NULL;
+	}
+
+	SimpleHvLog("[MmQuery] ===== RESOLVED =====");
+	SimpleHvLog("[MmQuery]   MmQueryVirtualMemory = 0x%llx (kernelBase+0x%llx)",
+	            (UINT64)(ULONG_PTR)found, (UINT64)((ULONG_PTR)found - (ULONG_PTR)kernelBase));
+	return found;
 }
 
 // ========================================
@@ -1262,6 +1689,142 @@ NTSTATUS NTAPI FakeMiCopyVirtualMemory(
 					SimpleHvLog("[MiCopy Hook] log limit reached (%u); further hits silent",
 					            MIRWM_HOOK_LOG_LIMIT);
 			}
+		}
+	}
+
+	return result;
+}
+
+// ========================================
+// Hook Handler: MmQueryVirtualMemory
+// ========================================
+
+/**
+ * @brief 把「进程句柄」解析成 PID（供 MmQueryVirtualMemory Hook 判断查询目标进程）
+ * @details - 伪句柄 -1（NtCurrentProcess）-> 当前进程；
+ *          - 其它句柄 -> ObReferenceObjectByHandle 拿到 EPROCESS 再取 PID。
+ *          DesiredAccess=0 + KernelMode：只做引用、不做访问检查，避免因句柄权限
+ *          不足（例如没有 PROCESS_QUERY_INFORMATION）而拿不到进程对象。
+ * @return TRUE 解析成功；FALSE 失败（调用方应放行）
+ */
+static BOOLEAN MmQuery_HandleToPid(HANDLE ProcessHandle, PULONG Pid)
+{
+	PEPROCESS process = NULL;
+	NTSTATUS  status;
+
+	if (Pid == NULL)
+		return FALSE;
+
+	/* 伪句柄 -1：当前进程 */
+	if (ProcessHandle == (HANDLE)(LONG_PTR)-1) {
+		*Pid = (ULONG)(ULONG_PTR)PsGetCurrentProcessId();
+		return TRUE;
+	}
+	if (ProcessHandle == NULL)
+		return FALSE;
+
+	status = ObReferenceObjectByHandle(
+		ProcessHandle, 0, *PsProcessType, KernelMode, (PVOID*)&process, NULL);
+	if (!NT_SUCCESS(status) || process == NULL)
+		return FALSE;
+
+	*Pid = (ULONG)(ULONG_PTR)PsGetProcessId(process);
+	ObDereferenceObject(process);
+	return TRUE;
+}
+
+/**
+ * @brief MmQueryVirtualMemory Hook 处理函数
+ * @details 查询「受保护模块地址区域」时，把返回的
+ *          MEMORY_BASIC_INFORMATION.Protect 伪装成 PAGE_NOACCESS，
+ *          让调用方以为这块内存不可访问 —— 配合 Hook 3（MiCopyVirtualMemory）
+ *          的读写拦截，进一步阻止内存扫描 / 转储工具。
+ *
+ *          改写条件（全部满足）：
+ *            - 原函数返回成功；
+ *            - MemoryInformationClass == MemoryBasicInformation（只有这个类带 Protect）；
+ *            - MemoryInformation / 长度有效；
+ *            - 被查询地址 BaseAddress 落在
+ *              [g_MiRWM_ProtectBase, +g_MiRWM_ProtectSize) 内；
+ *            - 查询目标进程（由 ProcessHandle 解析出的 PID）== g_MiRWM_TargetPid。
+ *
+ *          进程身份说明：MmQueryVirtualMemory 拿到的还是「句柄」，所以这里用
+ *          ObReferenceObjectByHandle 反查 PID；伪句柄 -1 视为当前进程。
+ *
+ *          复用 Hook 3 的同一份保护范围配置；未配置（Size==0）时纯透传。
+ */
+NTSTATUS NTAPI MmQueryVirtualMemoryHook(
+	HANDLE                    ProcessHandle,
+	PVOID                     BaseAddress,
+	MEMORY_INFORMATION_CLASS  MemoryInformationClass,
+	PVOID                     MemoryInformation,
+	SIZE_T                    MemoryInformationLength,
+	PSIZE_T                   ReturnLength,
+	ULONG                     Unknown)
+{
+	NTSTATUS  result;
+	ULONG_PTR protBase;
+	ULONG_PTR protSize;
+	ULONG     targetPid;
+	ULONG     queryPid;
+
+	/* trampoline 未就绪：不能调原函数（会死循环） */
+	if (old_MmQueryVirtualMemory == NULL)
+		return STATUS_UNSUCCESSFUL;
+
+	protSize = g_MiRWM_ProtectSize;
+
+	/* 未配置保护范围 -> 纯透传（7 个参数原样转发） */
+	if (protSize == 0) {
+		return old_MmQueryVirtualMemory(
+			ProcessHandle, BaseAddress, MemoryInformationClass,
+			MemoryInformation, MemoryInformationLength, ReturnLength, Unknown);
+	}
+
+	/* 先调用原函数，拿到真实结果 */
+	result = old_MmQueryVirtualMemory(
+		ProcessHandle, BaseAddress, MemoryInformationClass,
+		MemoryInformation, MemoryInformationLength, ReturnLength, Unknown);
+
+	/* 只处理成功 + 带 Protect 字段的类 + 参数有效的情况 */
+	if (!NT_SUCCESS(result) ||
+	    MemoryInformationClass != MemoryBasicInformation ||
+	    MemoryInformation == NULL ||
+	    MemoryInformationLength < sizeof(MEMORY_BASIC_INFORMATION)) {
+		return result;
+	}
+
+	protBase  = g_MiRWM_ProtectBase;
+	targetPid = (ULONG)g_MiRWM_TargetPid;
+
+	/* 便宜检查放前面：被查询地址必须落在保护范围内（len=1 表示「单点包含」） */
+	if (!RangesOverlap((ULONG_PTR)BaseAddress, 1, protBase, protSize))
+		return result;
+
+	/* 进程身份：解析 ProcessHandle -> PID，必须是被保护进程 */
+	if (!MmQuery_HandleToPid(ProcessHandle, &queryPid) || queryPid != targetPid)
+		return result;
+
+	/* 改写 Protect = PAGE_NOACCESS（原函数已校验过缓冲区，__try 兜底异常即可） */
+	__try {
+		((PMEMORY_BASIC_INFORMATION)MemoryInformation)->Protect = PAGE_NOACCESS;
+	}
+	__except (EXCEPTION_EXECUTE_HANDLER) {
+		SimpleHvLogError("[MmQuery Hook] rewrite Protect failed: 0x%x", GetExceptionCode());
+		return result;
+	}
+
+	/* 限流日志：只打印前 MMQUERY_HOOK_LOG_LIMIT 次命中 */
+	{
+		ULONG hit = (ULONG)InterlockedIncrement(&g_MmQuery_HookHitCount);
+		if (hit <= MMQUERY_HOOK_LOG_LIMIT) {
+			SimpleHvLog("[MmQuery Hook] #%u pid=%u query 0x%llx -> Protect forced to "
+			            "PAGE_NOACCESS (protect range [0x%llx, +0x%llx))",
+			            hit, targetPid, (UINT64)(ULONG_PTR)BaseAddress,
+			            (UINT64)protBase, (UINT64)protSize);
+			if (hit == MMQUERY_HOOK_LOG_LIMIT)
+				SimpleHvLog("[MmQuery Hook] log limit reached (%u); further hits silent",
+				            MMQUERY_HOOK_LOG_LIMIT);
 		}
 	}
 

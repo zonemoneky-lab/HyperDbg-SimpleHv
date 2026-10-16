@@ -15,6 +15,8 @@
  *          2. NtQuerySystemInformation - 隐藏指定进程
  *          3. MiCopyVirtualMemory - 拦截跨进程内存读写（从 MmCopyVirtualMemory 反汇编定位）
  *          4. MmCopyMemory - 拦截直接内存拷贝（导出函数，隐藏区域命中即阻断）
+ *          5. MmQueryVirtualMemory - 查询受保护模块区域时把 Protect 伪装成
+ *             PAGE_NOACCESS（未导出，特征码扫描定位；复用第 3 项的保护范围配置）
  *
  * @return NTSTATUS
  *         - STATUS_SUCCESS: 所有 Hook 安装成功
@@ -29,12 +31,15 @@ NTSTATUS InstallTestHooks(VOID);
 VOID ResetTestHooksState(VOID);
 
 /**
- * @brief 设置 MiCopyVirtualMemory Hook 的保护范围
- * @details 只保护「PID == ProcessId 的进程」中、地址落在
- *          [BaseAddress, BaseAddress + Size) 的内存读取：命中的那一段会被
- *          清零，范围之外完全不动。
+ * @brief 设置受保护模块区域（Hook 3 MiCopyVirtualMemory 与 Hook 5 MmQueryVirtualMemory 共用）
+ * @details 保护「PID == ProcessId 的进程」中、地址落在
+ *          [BaseAddress, BaseAddress + Size) 的模块区域：
+ *            - Hook 3：读取命中的那一段会被清零；写入命中直接拦截；
+ *            - Hook 5：查询该区域时，返回的 MEMORY_BASIC_INFORMATION.Protect
+ *              会被伪装成 PAGE_NOACCESS。
+ *          范围之外完全不动。
  *
- *          Size == 0 表示清除配置 / 关闭保护，此时 Hook 纯透传。
+ *          Size == 0 表示清除配置 / 关闭保护，此时两个 Hook 都纯透传。
  *
  * @param ProcessId   目标进程 PID
  * @param BaseAddress 受保护模块基址

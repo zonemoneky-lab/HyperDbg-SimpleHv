@@ -73,9 +73,12 @@ void RunSetMiRwmRangeTest(SimpleHv::Client& client) {
     std::cout << "========================================" << std::endl;
     std::cout << "   Set MiRWM Protect Range              " << std::endl;
     std::cout << "========================================" << std::endl;
-    std::cout << "  Only reads inside [Base, Base+Size)  " << std::endl;
-    std::cout << "  of the target PID are protected." << std::endl;
-    std::cout << "  (the intersected part is zeroed)" << std::endl;
+    std::cout << "  Region [Base, Base+Size) of target PID" << std::endl;
+    std::cout << "  is protected by BOTH:" << std::endl;
+    std::cout << "   - Hook 3 MiCopyVirtualMemory: reads " << std::endl;
+    std::cout << "     zeroed / writes denied" << std::endl;
+    std::cout << "   - Hook 5 MmQueryVirtualMemory: query " << std::endl;
+    std::cout << "     returns Protect = PAGE_NOACCESS" << std::endl;
     std::cout << "  Size = 0 disables protection." << std::endl;
     std::cout << "========================================" << std::endl;
     std::cout << std::endl;

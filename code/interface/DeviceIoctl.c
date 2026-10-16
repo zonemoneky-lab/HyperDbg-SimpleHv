@@ -100,7 +100,7 @@ HandleIoctlInstallTestHooks(PIRP Irp)
 
     response = (SIMPLEHV_INSTALL_HOOKS_RESPONSE*)Irp->AssociatedIrp.SystemBuffer;
     response->Status = status;
-    response->HooksInstalled = NT_SUCCESS(status) ? 4 : 0;
+    response->HooksInstalled = NT_SUCCESS(status) ? 5 : 0;
 
     if (NT_SUCCESS(status)) {
         SimpleHvLog("[DeviceIoctl] Test hooks installed successfully");
