@@ -33,6 +33,10 @@
 #define IOCTL_SIMPLEHV_SET_MMCOPY_REGION \
     CTL_CODE(FILE_DEVICE_SIMPLEHV, 0x804, METHOD_BUFFERED, FILE_ANY_ACCESS)
 
+// 开关 TSC offset 补偿（把 VM-exit 开销从 guest 的 RDTSC 里抹掉）
+#define IOCTL_SIMPLEHV_SET_TSC_OFFSET_COMPENSATION \
+    CTL_CODE(FILE_DEVICE_SIMPLEHV, 0x805, METHOD_BUFFERED, FILE_ANY_ACCESS)
+
 //////////////////////////////////////////////////
 //            Data Structures                   //
 //////////////////////////////////////////////////
@@ -100,6 +104,29 @@ typedef struct _SIMPLEHV_SET_MMCOPY_REGION_RESPONSE {
     UINT64 Start;           // 实际生效的起始地址
     UINT64 Size;            // 实际生效的大小
 } SIMPLEHV_SET_MMCOPY_REGION_RESPONSE, *PSIMPLEHV_SET_MMCOPY_REGION_RESPONSE;
+
+/**
+ * @brief 设置 TSC offset 补偿模式的请求
+ * @details Mode 取值（与驱动端 VmxFootprints.h 一致）：
+ *            0 = 关闭，并把所有核心的 VMCS TSC_OFFSET 复位为 0
+ *            1 = 只补偿 CPUID / RDTSC / RDTSCP 引起的 VM-exit（安全，默认档）
+ *            2 = 补偿每一次 VM-exit（最强，但 guest TSC 会持续落后于真实时间，
+ *                且各核偏移独立累积，可能出现核间 TSC 漂移）
+ */
+typedef struct _SIMPLEHV_SET_TSC_OFFSET_REQUEST {
+    UINT32 Mode;            // 0 = off, 1 = cpuid-only, 2 = all exits
+    UINT32 Reserved;        // 对齐填充
+} SIMPLEHV_SET_TSC_OFFSET_REQUEST, *PSIMPLEHV_SET_TSC_OFFSET_REQUEST;
+
+/**
+ * @brief 设置 TSC offset 补偿模式的响应（回显状态 + 统计）
+ */
+typedef struct _SIMPLEHV_SET_TSC_OFFSET_RESPONSE {
+    UINT32 Status;                  // NTSTATUS
+    UINT32 Mode;                    // 实际生效的模式
+    UINT64 TotalCompensated;        // 累计从 guest TSC 里抹掉的周期数
+    UINT64 CompensationCount;       // 执行过补偿的 VM-exit 次数
+} SIMPLEHV_SET_TSC_OFFSET_RESPONSE, *PSIMPLEHV_SET_TSC_OFFSET_RESPONSE;
 
 //////////////////////////////////////////////////
 //            Function Declarations             //

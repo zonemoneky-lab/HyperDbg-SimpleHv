@@ -130,6 +130,46 @@ PVOID g_SystemCallHookAddress;
  */
 BOOLEAN g_CheckForFootprints;
 
+/**
+ * @brief The current TSC offset compensation mode (see VmxFootprints.h).
+ *
+ * @details When non-zero, VM-exits subtract the time spent in VMX root mode
+ * from the guest's TSC offset (VMCS TSC_OFFSET field). This hides the
+ * VM-exit/VM-entry round trip from the guest, defeating the classic
+ * "RDTSC -> CPUID -> RDTSC" anti-hypervisor timing check.
+ *
+ *          Possible values:
+ *            TSC_OFFSET_COMPENSATION_OFF        (0) disabled - default
+ *            TSC_OFFSET_COMPENSATION_CPUID_ONLY (1) only CPUID/RDTSC/RDTSCP
+ *                                                   exits - safe, negligible
+ *                                                   TSC drift and core skew
+ *            TSC_OFFSET_COMPENSATION_ALL_EXITS  (2) every VM-exit - strongest,
+ *                                                   but the guest TSC drifts
+ *                                                   behind real time and cores
+ *                                                   can drift apart from each
+ *                                                   other
+ *
+ *          Because a varying TSC offset is what makes the guest's TSC advance
+ * slower than real time, this is intended for short-lived anti-analysis
+ * scenarios, not for a long-running production system.
+ *
+ */
+UINT32 g_TscOffsetCompensation;
+
+/**
+ * @brief Total number of TSC cycles that have been hidden from the guest
+ * by the TSC offset compensation mechanism (informational only)
+ *
+ */
+volatile UINT64 g_TscOffsetTotalCompensated;
+
+/**
+ * @brief Number of VM-exits on which the TSC offset compensation was applied
+ * (informational only)
+ *
+ */
+volatile UINT64 g_TscOffsetCompensationCount;
+
 //////////////////////////////////////////////////
 //  	Global Variable (debugger-related)	    //
 //////////////////////////////////////////////////

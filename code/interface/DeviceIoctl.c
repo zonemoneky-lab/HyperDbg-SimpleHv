@@ -223,6 +223,68 @@ HandleIoctlSetMmCopyRegion(PIRP Irp)
 }
 
 /**
+ * @brief Handle IOCTL_SIMPLEHV_SET_TSC_OFFSET_COMPENSATION
+ * @details 设置 TSC offset 补偿模式。
+ *
+ *          Mode = 1（安全档）：只补偿 CPUID / RDTSC / RDTSCP 引起的 VM-exit。
+ *          此时每次这类 VM-exit 都会把 VMX 根模式耗时从 guest 的 VMCS
+ *          TSC_OFFSET 里扣掉，guest 读到的 TSC 就等于"没有被 VM-exit 打断"，
+ *          从而抹掉 RDTSC -> CPUID -> RDTSC 这类时序检测看到的时间差。因为
+ *          CPUID 在正常负载里很少见，累计偏移极小，TSC 漂移和核间偏移可忽略。
+ *
+ *          Mode = 2（激进档）：补偿每一次 VM-exit，包括我们自己 EPT hook 造成的
+ *          EPT violation。最强，但 guest TSC 会持续落后于真实时间。
+ *
+ *          Mode = 0：关闭补偿，并广播把所有核心的 TSC_OFFSET 复位为 0。
+ *          NOTE: 复位会让 guest 的 TSC 一次性向前跳变"累计偏移"那么多
+ *          （这是刻意的，否则 guest 的 TSC 会永久落后于真实时间）。刚打开
+ *          补偿就立刻关闭的话，累计偏移很小，跳变可以忽略。
+ */
+NTSTATUS
+HandleIoctlSetTscOffsetCompensation(PIRP Irp)
+{
+    PIO_STACK_LOCATION irpStack;
+    SIMPLEHV_SET_TSC_OFFSET_REQUEST*  request;
+    SIMPLEHV_SET_TSC_OFFSET_RESPONSE* response;
+    ULONG inputBufferLength;
+    ULONG outputBufferLength;
+    UINT32 mode;
+
+    irpStack           = IoGetCurrentIrpStackLocation(Irp);
+    inputBufferLength  = irpStack->Parameters.DeviceIoControl.InputBufferLength;
+    outputBufferLength = irpStack->Parameters.DeviceIoControl.OutputBufferLength;
+
+    if (inputBufferLength < sizeof(SIMPLEHV_SET_TSC_OFFSET_REQUEST)) {
+        SimpleHvLogError("[DeviceIoctl] SET_TSC_OFFSET: Input buffer too small (%u < %u)",
+                         inputBufferLength, (ULONG)sizeof(SIMPLEHV_SET_TSC_OFFSET_REQUEST));
+        return STATUS_BUFFER_TOO_SMALL;
+    }
+    if (outputBufferLength < sizeof(SIMPLEHV_SET_TSC_OFFSET_RESPONSE)) {
+        SimpleHvLogError("[DeviceIoctl] SET_TSC_OFFSET: Output buffer too small (%u < %u)",
+                         outputBufferLength, (ULONG)sizeof(SIMPLEHV_SET_TSC_OFFSET_RESPONSE));
+        return STATUS_BUFFER_TOO_SMALL;
+    }
+
+    // METHOD_BUFFERED: 输入 / 输出共用 SystemBuffer，先读出来再写回
+    request = (SIMPLEHV_SET_TSC_OFFSET_REQUEST*)Irp->AssociatedIrp.SystemBuffer;
+    mode    = (UINT32)request->Mode;
+
+    SimpleHvLog("[DeviceIoctl] SET_TSC_OFFSET: mode=%u", mode);
+
+    // 应用到 VMM（内部会打自己的日志）
+    VmFuncSetTscOffsetCompensation(mode);
+
+    response = (SIMPLEHV_SET_TSC_OFFSET_RESPONSE*)Irp->AssociatedIrp.SystemBuffer;
+    response->Status            = (UINT32)STATUS_SUCCESS;
+    response->Mode              = (UINT32)g_TscOffsetCompensation;
+    response->TotalCompensated  = (UINT64)g_TscOffsetTotalCompensated;
+    response->CompensationCount = (UINT64)g_TscOffsetCompensationCount;
+
+    Irp->IoStatus.Information = sizeof(SIMPLEHV_SET_TSC_OFFSET_RESPONSE);
+    return STATUS_SUCCESS;
+}
+
+/**
  * @brief Handle IOCTL_SIMPLEHV_UNHOOK_ALL
  */
 NTSTATUS
@@ -279,6 +341,10 @@ DeviceIoctlDispatch(PDEVICE_OBJECT DeviceObject, PIRP Irp)
 
         case IOCTL_SIMPLEHV_SET_MMCOPY_REGION:
             status = HandleIoctlSetMmCopyRegion(Irp);
+            break;
+
+        case IOCTL_SIMPLEHV_SET_TSC_OFFSET_COMPENSATION:
+            status = HandleIoctlSetTscOffsetCompensation(Irp);
             break;
 
         default:

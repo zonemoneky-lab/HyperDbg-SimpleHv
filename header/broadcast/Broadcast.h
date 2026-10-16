@@ -44,3 +44,6 @@ BroadcasDisableMbecOnAllProcessors();
 
 VOID
 BroadcasEnableMbecOnAllProcessors();
+
+VOID
+BroadcastResetTscOffsetOnAllCores();

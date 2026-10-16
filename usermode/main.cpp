@@ -13,6 +13,7 @@ void PrintMenu() {
     std::cout << "  3. Unhook All" << std::endl;
     std::cout << "  4. Set MiRWM Protect Range (PID + Module)" << std::endl;
     std::cout << "  5. Set MmCopyMemory Hide Region" << std::endl;
+    std::cout << "  6. Toggle TSC Offset Compensation" << std::endl;
     std::cout << "  0. Exit" << std::endl;
     std::cout << "========================================" << std::endl;
     std::cout << "Select option: ";
@@ -212,7 +213,86 @@ void RunSetMmCopyRegionTest(SimpleHv::Client& client) {
     std::cout << std::endl;
 }
 
+void RunTscOffsetCompensationTest(SimpleHv::Client& client) {
+    std::cout << std::endl;
+    std::cout << "========================================" << std::endl;
+    std::cout << "   TSC Offset Compensation              " << std::endl;
+    std::cout << "========================================" << std::endl;
+    std::cout << "  Hides the VM-exit/VM-entry round trip" << std::endl;
+    std::cout << "  from the guest's RDTSC/RDTSCP." << std::endl;
+    std::cout << "  Defeats: RDTSC -> CPUID -> RDTSC" << std::endl;
+    std::cout << "  (CPUID always causes a VM-exit)." << std::endl;
+    std::cout << std::endl;
+    std::cout << "  Modes:" << std::endl;
+    std::cout << "   1 = CPUID/RDTSC/RDTSCP exits only" << std::endl;
+    std::cout << "       SAFE (recommended). CPUID is rare" << std::endl;
+    std::cout << "       so TSC drift and core skew are" << std::endl;
+    std::cout << "       negligible." << std::endl;
+    std::cout << "   2 = every VM-exit (strongest). The" << std::endl;
+    std::cout << "       guest TSC drifts behind real time" << std::endl;
+    std::cout << "       and cores can drift apart." << std::endl;
+    std::cout << "   0 = off, resets every core's TSC" << std::endl;
+    std::cout << "       offset back to zero." << std::endl;
+    std::cout << "========================================" << std::endl;
+    std::cout << std::endl;
+
+    UINT64 mode = 0;
+    if (!ReadUInt64("[*] Mode (0 = off, 1 = cpuid-only, 2 = all exits): ", mode)) {
+        std::cout << "[-] Invalid input" << std::endl;
+        std::cout << std::endl;
+        return;
+    }
+    if (mode > 2) {
+        std::cout << "[-] Mode must be 0, 1 or 2" << std::endl;
+        std::cout << std::endl;
+        return;
+    }
+
+    std::cout << std::endl;
+    std::cout << "[*] Sending IOCTL_SIMPLEHV_SET_TSC_OFFSET_COMPENSATION..." << std::endl;
+    std::cout << "    Mode: " << mode << std::endl;
+
+    SIMPLEHV_SET_TSC_OFFSET_RESPONSE response = { 0 };
+    if (client.SetTscOffsetCompensation((UINT32)mode, &response)) {
+        std::cout << "[*] IOCTL completed" << std::endl;
+        std::cout << "    Status             : 0x" << std::hex << std::uppercase
+                  << response.Status << std::dec << std::endl;
+        std::cout << "    Applied mode       : " << response.Mode << std::endl;
+        std::cout << "    Compensated cycles : 0x" << std::hex << std::uppercase
+                  << response.TotalCompensated << std::dec << std::endl;
+        std::cout << "    Compensation count : " << response.CompensationCount << std::endl;
+
+        if (response.Status == 0) {
+            switch (response.Mode) {
+                case 1:
+                    std::cout << "[+] Mode 1 (cpuid-only) active - safe" << std::endl;
+                    break;
+                case 2:
+                    std::cout << "[+] Mode 2 (all exits) active" << std::endl;
+                    std::cout << "    WARNING: guest TSC now drifts behind real" << std::endl;
+                    std::cout << "    time. Use only for short tests." << std::endl;
+                    break;
+                default:
+                    std::cout << "[+] Compensation OFF (all cores' TSC offset reset)" << std::endl;
+                    break;
+            }
+            std::cout << std::endl;
+            std::cout << "    Timing check to try (run twice, compare):" << std::endl;
+            std::cout << "      RDTSC -> CPUID -> RDTSC" << std::endl;
+            std::cout << "    With mode 1/2 the delta should look like" << std::endl;
+            std::cout << "    bare metal (no VM-exit overhead visible)." << std::endl;
+        } else {
+            std::cout << "[-] Failed to set TSC offset compensation" << std::endl;
+        }
+    } else {
+        std::cout << "[-] IOCTL failed! Error: " << GetLastError() << std::endl;
+    }
+
+    std::cout << std::endl;
+}
+
 int main() {
+
     std::cout << "========================================" << std::endl;
     std::cout << "   SimpleHv Usermode Test Client       " << std::endl;
     std::cout << "========================================" << std::endl;
@@ -319,6 +399,12 @@ int main() {
 
             case 5:
                 RunSetMmCopyRegionTest(client);
+                std::cout << "Press any key to continue..." << std::endl;
+                system("pause");
+                break;
+
+            case 6:
+                RunTscOffsetCompensationTest(client);
                 std::cout << "Press any key to continue..." << std::endl;
                 system("pause");
                 break;

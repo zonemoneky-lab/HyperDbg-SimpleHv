@@ -333,6 +333,12 @@ VmxVmcallHandler(VIRTUAL_MACHINE_STATE * VCpu,
         VmcallStatus = STATUS_SUCCESS;
         break;
     }
+    case VMCALL_RESET_TSC_OFFSET:
+    {
+        CounterResetTscOffset(VCpu);
+        VmcallStatus = STATUS_SUCCESS;
+        break;
+    }
     case VMCALL_ENABLE_MOV_TO_CONTROL_REGS_EXITING:
     {
         HvSetMovControlRegsExiting(TRUE, OptionalParam1, OptionalParam2);

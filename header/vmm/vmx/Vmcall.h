@@ -321,6 +321,14 @@
  */
 #define VMCALL_WRITE_PHYSICAL_MEMORY 0x00000031
 
+/**
+ * @brief VMCALL to reset the guest TSC offset (VMCS TSC_OFFSET) back to zero
+ * @details Used when the TSC offset compensation is being disabled, so that
+ * the guest's time-stamp counter returns to its real value.
+ *
+ */
+#define VMCALL_RESET_TSC_OFFSET 0x00000032
+
 //////////////////////////////////////////////////
 //				    Functions					//
 //////////////////////////////////////////////////

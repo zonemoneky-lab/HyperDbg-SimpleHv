@@ -15,11 +15,12 @@
  * @brief VM-Exit handler for different exit reasons
  *
  * @param GuestRegs Registers that are automatically saved by AsmVmexitHandler (HOST_RIP)
+ * @param TscAtVmexit TSC value captured by AsmVmexitHandler on VM-exit entry
  * @return BOOLEAN Return True if VMXOFF executed (not in vmx anymore),
  *  or return false if we are still in vmx (so we should use vm resume)
  */
 BOOLEAN
-VmxVmexitHandler(_Inout_ PGUEST_REGS GuestRegs)
+VmxVmexitHandler(_Inout_ PGUEST_REGS GuestRegs, _In_ UINT64 TscAtVmexit)
 {
     UINT32                  ExitReason = 0;
     BOOLEAN                 Result     = FALSE;
@@ -366,6 +367,35 @@ VmxVmexitHandler(_Inout_ PGUEST_REGS GuestRegs)
     if (VCpu->VmxoffState.IsVmxoffExecuted)
     {
         Result = TRUE;
+    }
+
+    //
+    // Hide the time we spent in VMX root mode from the guest's time-stamp
+    // counter (only when the compensation mechanism was explicitly enabled).
+    //
+    // Without this, "RDTSC -> CPUID -> RDTSC" reveals the hypervisor because
+    // CPUID unconditionally causes a VM-exit and the guest can measure the
+    // whole VM-exit/VM-entry round trip inside the TSC delta.
+    //
+    // We must not do this when we are about to leave VMX (VMXOFF): the VMCS
+    // is no longer ours after the guest executes VMXOFF.
+    //
+    if (g_TscOffsetCompensation != TSC_OFFSET_COMPENSATION_OFF &&
+        !VCpu->VmxoffState.IsVmxoffExecuted)
+    {
+        //
+        // In the safe (CPUID-only) mode we only compensate the exits that a
+        // timing-based anti-hypervisor check actually relies on. This keeps the
+        // accumulated TSC drift and the cross-core TSC skew negligible, because
+        // CPUID is rare in normal workloads.
+        //
+        if (g_TscOffsetCompensation == TSC_OFFSET_COMPENSATION_ALL_EXITS ||
+            ExitReason == VMX_EXIT_REASON_EXECUTE_CPUID ||
+            ExitReason == VMX_EXIT_REASON_EXECUTE_RDTSC ||
+            ExitReason == VMX_EXIT_REASON_EXECUTE_RDTSCP)
+        {
+            CounterApplyTscOffsetCompensation(VCpu, TscAtVmexit);
+        }
     }
 
     //

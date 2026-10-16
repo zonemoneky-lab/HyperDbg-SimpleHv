@@ -17,7 +17,12 @@
 //
 
 // Main VM-Exit handler (called from assembly)
-BOOLEAN VmxVmexitHandler(PGUEST_REGS GuestRegs);
+//
+// TscAtVmexit is captured by AsmVmexitHandler right at VM-exit entry (after all
+// guest general-purpose registers have been saved) and is used to hide the VMX
+// root-mode duration from the guest's time-stamp counter.
+//
+BOOLEAN VmxVmexitHandler(PGUEST_REGS GuestRegs, UINT64 TscAtVmexit);
 
 // Specific exit handlers
 VOID VmxHandleCpuid(PVIRTUAL_MACHINE_STATE VmState);

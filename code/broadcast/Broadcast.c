@@ -536,3 +536,17 @@ BroadcastDisablePmlOnAllProcessors()
 {
     KeGenericCallDpc(DpcRoutineDisablePml, 0x0);
 }
+
+/**
+ * @brief routines for resetting the guest TSC offset to zero on all cores
+ *
+ * @details Used when the TSC offset compensation is disabled, so that the
+ * guest's time-stamp counter returns to its real value on every core.
+ *
+ * @return VOID
+ */
+VOID
+BroadcastResetTscOffsetOnAllCores()
+{
+    KeGenericCallDpc(DpcRoutineResetTscOffsetOnAllCores, 0x0);
+}

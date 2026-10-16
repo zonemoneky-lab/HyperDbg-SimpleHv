@@ -31,6 +31,9 @@
 #define IOCTL_SIMPLEHV_SET_MMCOPY_REGION \
     CTL_CODE(FILE_DEVICE_SIMPLEHV, 0x804, METHOD_BUFFERED, FILE_ANY_ACCESS)
 
+#define IOCTL_SIMPLEHV_SET_TSC_OFFSET_COMPENSATION \
+    CTL_CODE(FILE_DEVICE_SIMPLEHV, 0x805, METHOD_BUFFERED, FILE_ANY_ACCESS)
+
 //////////////////////////////////////////////////
 //            Data Structures                   //
 //////////////////////////////////////////////////
@@ -75,6 +78,19 @@ typedef struct _SIMPLEHV_SET_MMCOPY_REGION_RESPONSE {
     UINT64 Start;           // 实际生效的起始地址
     UINT64 Size;            // 实际生效的大小
 } SIMPLEHV_SET_MMCOPY_REGION_RESPONSE, *PSIMPLEHV_SET_MMCOPY_REGION_RESPONSE;
+
+// 设置 TSC offset 补偿模式（必须与驱动端 DeviceIoctl.h 布局一致）
+typedef struct _SIMPLEHV_SET_TSC_OFFSET_REQUEST {
+    UINT32 Mode;            // 0 = off, 1 = cpuid-only, 2 = all exits
+    UINT32 Reserved;        // 对齐填充
+} SIMPLEHV_SET_TSC_OFFSET_REQUEST, *PSIMPLEHV_SET_TSC_OFFSET_REQUEST;
+
+typedef struct _SIMPLEHV_SET_TSC_OFFSET_RESPONSE {
+    UINT32 Status;                  // NTSTATUS
+    UINT32 Mode;                    // 实际生效的模式
+    UINT64 TotalCompensated;        // 累计从 guest TSC 里抹掉的周期数
+    UINT64 CompensationCount;       // 执行过补偿的 VM-exit 次数
+} SIMPLEHV_SET_TSC_OFFSET_RESPONSE, *PSIMPLEHV_SET_TSC_OFFSET_RESPONSE;
 
 //////////////////////////////////////////////////
 //            SimpleHv Client Class             //
@@ -220,6 +236,33 @@ public:
             sizeof(SIMPLEHV_SET_MMCOPY_REGION_REQUEST),
             response,
             sizeof(SIMPLEHV_SET_MMCOPY_REGION_RESPONSE),
+            &bytesReturned,
+            NULL
+        ) != FALSE;
+    }
+
+    /**
+     * @brief Set the TSC offset compensation mode
+     * @details 1 = 只补偿 CPUID/RDTSC/RDTSCP 引起的 VM-exit（安全档）
+     *          2 = 补偿每一次 VM-exit（激进档）
+     *          0 = 关闭，并广播把所有核心的 TSC_OFFSET 复位为 0
+     */
+    bool SetTscOffsetCompensation(UINT32 mode,
+                                  SIMPLEHV_SET_TSC_OFFSET_RESPONSE* response) {
+        if (!IsConnected()) return false;
+
+        SIMPLEHV_SET_TSC_OFFSET_REQUEST request = { 0 };
+        request.Mode     = mode;
+        request.Reserved = 0;
+
+        DWORD bytesReturned;
+        return DeviceIoControl(
+            hDevice,
+            IOCTL_SIMPLEHV_SET_TSC_OFFSET_COMPENSATION,
+            &request,
+            sizeof(SIMPLEHV_SET_TSC_OFFSET_REQUEST),
+            response,
+            sizeof(SIMPLEHV_SET_TSC_OFFSET_RESPONSE),
             &bytesReturned,
             NULL
         ) != FALSE;

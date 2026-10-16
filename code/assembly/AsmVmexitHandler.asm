@@ -70,6 +70,24 @@ AsmVmexitHandler PROC
     push rcx
     push rax	
 
+    ; ----------- Capture the TSC at VM-exit entry -----------
+
+    ;
+    ; Every guest general-purpose register is already saved on the stack at
+    ; this point, so RAX/RDX can be safely clobbered to read the time-stamp
+    ; counter. The value is handed to the C handler as its second argument
+    ; (RDX) so that the handler can subtract the VMX root-mode duration from
+    ; the guest's TSC offset (VMCS TSC_OFFSET field).
+    ;
+    ; NOTE: RSP is untouched here, so the GUEST_REGS pointer below is still
+    ; valid and the stack layout of this frame does not change.
+    ;
+
+    rdtsc
+    shl     rdx, 32
+    or      rax, rdx
+    mov     rdx, rax            ; 2nd argument = TSC at VM-exit entry
+
     ; ----------- Call VM-exit Handler -----------
 
     mov rcx, rsp		; Fast call argument to PGUEST_REGS

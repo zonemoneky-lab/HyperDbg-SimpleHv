@@ -100,6 +100,9 @@ IMPORT_EXPORT_VMM VOID
 VmFuncSetMovDebugRegsExiting(UINT32 CoreId, BOOLEAN Set);
 
 IMPORT_EXPORT_VMM VOID
+VmFuncSetTscOffsetCompensation(UINT32 Mode);
+
+IMPORT_EXPORT_VMM VOID
 VmFuncInjectPendingExternalInterrupts(UINT32 CoreId);
 
 IMPORT_EXPORT_VMM VOID

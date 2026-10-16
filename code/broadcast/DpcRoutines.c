@@ -1766,3 +1766,34 @@ DpcRoutineTerminateGuest(KDPC * Dpc, PVOID DeferredContext, PVOID SystemArgument
     //
     KeSignalCallDpcDone(SystemArgument1);
 }
+
+/**
+ * @brief Reset the guest TSC offset (VMCS TSC_OFFSET) to zero on all cores
+ *
+ * @param Dpc
+ * @param DeferredContext
+ * @param SystemArgument1
+ * @param SystemArgument2
+ * @return VOID
+ */
+VOID
+DpcRoutineResetTscOffsetOnAllCores(KDPC * Dpc, PVOID DeferredContext, PVOID SystemArgument1, PVOID SystemArgument2)
+{
+    UNREFERENCED_PARAMETER(Dpc);
+    UNREFERENCED_PARAMETER(DeferredContext);
+
+    //
+    // Reset the TSC offset from vmx-root
+    //
+    AsmVmxVmcall(VMCALL_RESET_TSC_OFFSET, NULL64_ZERO, 0, 0);
+
+    //
+    // Wait for all DPCs to synchronize at this point
+    //
+    KeSignalCallDpcSynchronize(SystemArgument2);
+
+    //
+    // Mark the DPC as being complete
+    //
+    KeSignalCallDpcDone(SystemArgument1);
+}

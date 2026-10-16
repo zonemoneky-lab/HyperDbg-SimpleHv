@@ -309,6 +309,55 @@ VmFuncSetMovDebugRegsExiting(UINT32 CoreId, BOOLEAN Set)
 }
 
 /**
+ * @brief Set the guest TSC offset compensation mode
+ *
+ * @details When non-zero, VM-exits subtract the VMX root-mode duration from
+ * the guest's VMCS TSC_OFFSET field, which hides the VM-exit/VM-entry round
+ * trip from the guest's RDTSC/RDTSCP (defeats "RDTSC -> CPUID -> RDTSC").
+ *
+ *          When set to TSC_OFFSET_COMPENSATION_OFF, the accumulated offset is
+ * reset to zero on every core through a broadcast VMCALL, so the guest's TSC
+ * returns to its real value.
+ *
+ * @param Mode TSC_OFFSET_COMPENSATION_OFF / _CPUID_ONLY / _ALL_EXITS
+ * @return VOID
+ */
+VOID
+VmFuncSetTscOffsetCompensation(UINT32 Mode)
+{
+    if (Mode != TSC_OFFSET_COMPENSATION_OFF &&
+        Mode != TSC_OFFSET_COMPENSATION_CPUID_ONLY &&
+        Mode != TSC_OFFSET_COMPENSATION_ALL_EXITS)
+    {
+        SimpleHvLogWarning("[TscOffset] Invalid compensation mode: %u", Mode);
+        return;
+    }
+
+    g_TscOffsetCompensation = Mode;
+
+    SimpleHvLog("[TscOffset] Compensation mode = %u (compensated 0x%llx cycles over 0x%llx vm-exits)",
+                Mode,
+                g_TscOffsetTotalCompensated,
+                g_TscOffsetCompensationCount);
+
+    if (Mode == TSC_OFFSET_COMPENSATION_OFF)
+    {
+        //
+        // Give the guest its real TSC back. This must be done from VMX root
+        // mode on every core, hence the broadcast VMCALL.
+        //
+        if (g_GuestState[0].HasLaunched)
+        {
+            BroadcastResetTscOffsetOnAllCores();
+        }
+        else
+        {
+            SimpleHvLogWarning("[TscOffset] VMX is not running, TSC offset not reset");
+        }
+    }
+}
+
+/**
  * @brief get the last vm-exit RIP
  *
  * @param CoreId Target core's ID
